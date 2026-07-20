@@ -40,11 +40,12 @@ INTERRUPT_ON_NEW = True     # 新独白到来是否打断当前在念的
 
 # —— 低语基础音色（所有情绪共享的底色）——
 BASE_GAIN_DB      = -14.0   # 整体压低音量
-LOWPASS_HZ        = 3200    # 低通截止，闷一点、贴近耳语
+LOWPASS_HZ        = 150     # 低通截止，砍掉共振峰只留基频区，人声→低频嗡鸣
 BREATH_MIX        = 0.10    # 混入的气声/白噪比例（0~0.3）
 REVERB_MIX        = 0.12    # 轻混响 wet 比例（0~0.4）
 REVERB_DECAY      = 0.28    # 简易反馈延迟的衰减
 HP_HZ             = 120     # 高通去掉低频轰鸣，更像气声
+ENVELOPE_FOLLOW   = 0.85    # 包络保留强度 0~1：嗡鸣跟随原始语音音节起伏的程度
 
 # —— 情绪 → 语速/音高/停顿 映射（8 个 stage，改这里最直接）——
 # rate: >1 更慢（Piper length_scale 语义；这里统一成"越大越慢"），
@@ -197,6 +198,44 @@ def apply_pitch(sig, sr, semitones):
     return restored.astype(np.float32)
 
 
+def extract_envelope(sig, sr):
+    """从原始语音提取平滑的 RMS 振幅包络（音节级强弱轮廓）。
+
+    必须在低通之前对原始语音调用——低通之后音节强弱信息已被砍掉。
+    返回与 sig 等长、范围约 0~1 的包络数组。
+    """
+    if len(sig) < 16:
+        return np.ones_like(sig)
+    rectified = np.abs(sig)
+    # 平滑窗约 20ms，对应音节级别的强弱起伏（不是逐样本、也不是整句）
+    win = max(1, int(sr * 0.02))
+    if win > 1:
+        kernel = np.ones(win) / win
+        env = np.convolve(rectified, kernel, mode="same")
+    else:
+        env = rectified
+    peak = np.max(env) if len(env) else 0.0
+    if peak > 1e-9:
+        env = env / peak
+    return env.astype(np.float32)
+
+
+def apply_envelope(sig, envelope, follow):
+    """把原始语音的包络乘回（已低通的）嗡鸣信号，实现音节级同步。
+
+    follow=0 时不改变 sig；follow=1 时嗡鸣完全跟随包络起伏。
+    中间值按 (1-follow) + follow*envelope 的增益曲线混合，
+    保留少量底噪避免音节间隙彻底断掉。
+    """
+    if follow <= 0 or len(sig) < 16:
+        return sig
+    if len(envelope) != len(sig):
+        # 长度不一致（理论上不会发生）时安全退回，不做包络
+        return sig
+    gain = (1.0 - follow) + follow * envelope
+    return (sig * gain).astype(np.float32)
+
+
 def add_breath(sig, level):
     if level <= 0 or len(sig) < 16:
         return sig
@@ -238,7 +277,11 @@ def _soft_limit(sig, ceiling=0.95):
 def whisperize(sig, sr, voice_params):
     sig = apply_highpass(sig, sr, HP_HZ)
     sig = apply_pitch(sig, sr, voice_params.get("pitch", 0.0))
+    # 包络必须在低通之前从（含音节强弱的）语音提取
+    envelope = extract_envelope(sig, sr)
     sig = apply_lowpass(sig, sr, LOWPASS_HZ)
+    # 低通后信号已是低频嗡；把原语音包络乘回，让嗡随音节起伏（音节级同步）
+    sig = apply_envelope(sig, envelope, ENVELOPE_FOLLOW)
     sig = add_breath(sig, BREATH_MIX)
     sig = add_reverb(sig, sr, REVERB_MIX, REVERB_DECAY)
     sig = apply_gain_db(sig, BASE_GAIN_DB + voice_params.get("gain_db", 0.0) - DEFAULT_VOICE["gain_db"])
