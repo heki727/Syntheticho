@@ -1,0 +1,325 @@
+/*
+ * Narcissus WIP2 — ToF + Servo
+ *
+ * 串口命令：
+ *   UNITING_ON   : 进入 uniting / reassembling 阶段
+ *                  舵机停转 detach，但 ToF 继续工作，LOOK_HUMAN / LOOK_SELF 照常发送
+ *
+ *   UNITING_OFF  : 退出 uniting / reassembling 阶段
+ *                  舵机重新 attach，并移动到当前状态对应角度，同时补发当前 LOOK 状态
+ *
+ *   MOTION_OFF   : 等同 UNITING_ON
+ *   MOTION_ON    : 等同 UNITING_OFF
+ *   GO_SELF      : 只有当前在 HUMAN 状态时，强制回 SELF
+ *   GO_SELF_HOLD : 强制回 SELF，并保持 SELF 直到 ToF 距离释放
+ */
+
+#include <Wire.h>
+#include <vl53l4cd_class.h>
+#include <Servo.h>
+
+#define DEBUG_PRINT        1
+
+#define TOF_MIN_VALID_MM   30     // 小于此值视为串扰幻影 → 当作无目标
+#define TOF_TRIGGER_MM     280    // 实测：靠近到 360mm 内 = 有人
+#define TOF_RELEASE_MM     400    // 超过 400mm（或无效）= 人远离
+
+#define ANGLE_SELF         0
+#define ANGLE_HUMAN        90
+
+#define SERVO_PIN          9
+#define XSHUT_PIN          2
+
+#define SERVO_MOVE_MS         1500
+#define SERVO_MOVE_SELF_MS    SERVO_MOVE_MS            // 看自己：基础速率
+#define SERVO_MOVE_HUMAN_MS   (SERVO_MOVE_MS - 200)    // 看人：比看自己快 200ms
+#define SERIAL_BAUD        9600
+#define DEBUG_INTERVAL_MS  500
+
+VL53L4CD tof(&Wire, XSHUT_PIN);
+Servo servo;
+
+enum State {
+  STATE_SELF,
+  STATE_TO_HUMAN,
+  STATE_HUMAN,
+  STATE_TO_SELF
+};
+
+State state = STATE_SELF;
+
+unsigned long transition_started_at = 0;
+unsigned long last_debug_print_at = 0;
+
+// ===== 舵机缓动扫描状态 =====
+// 不再一次性 write 目标角度，而是在 sweep_duration 毫秒内，
+// 从 sweep_from_angle 逐步插值到 sweep_to_angle，让物理旋转真正变慢。
+int servo_current_angle   = ANGLE_SELF;   // 舵机当前所在角度（每次 write 都更新）
+int sweep_from_angle      = ANGLE_SELF;   // 本次扫描起点
+int sweep_to_angle        = ANGLE_SELF;   // 本次扫描终点
+unsigned long sweep_duration = SERVO_MOVE_MS;  // 本次扫描时长（看人/看自己不同）
+
+uint16_t last_distance = 9999;
+uint8_t last_status = 255;
+
+bool tof_ok = false;
+bool servo_motion_enabled = true;
+bool hold_self_until_release = false;
+
+const char* state_name(State s) {
+  switch (s) {
+    case STATE_SELF:      return "SELF";
+    case STATE_TO_HUMAN:  return "TO_HUMAN";
+    case STATE_HUMAN:     return "HUMAN";
+    case STATE_TO_SELF:   return "TO_SELF";
+  }
+  return "?";
+}
+
+int angle_for_state(State s) {
+  switch (s) {
+    case STATE_SELF:
+    case STATE_TO_SELF:
+      return ANGLE_SELF;
+
+    case STATE_HUMAN:
+    case STATE_TO_HUMAN:
+      return ANGLE_HUMAN;
+  }
+
+  return ANGLE_SELF;
+}
+
+void servo_command(int angle) {
+  if (servo_motion_enabled) {
+    servo.write(angle);
+  }
+  servo_current_angle = angle;   // 即使 motion off 也记录逻辑角度，便于下次扫描起点
+}
+
+// 开始一次缓动扫描：从当前角度，在 duration 毫秒内移动到 target。
+void start_sweep(int target, unsigned long duration) {
+  sweep_from_angle = servo_current_angle;
+  sweep_to_angle = target;
+  sweep_duration = duration;
+  transition_started_at = millis();
+}
+
+// 每个 loop 调用一次：根据已用时间线性插值，写入中间角度。
+void update_sweep() {
+  if (sweep_duration == 0) {
+    servo_command(sweep_to_angle);
+    return;
+  }
+  unsigned long elapsed = millis() - transition_started_at;
+  if (elapsed >= sweep_duration) {
+    servo_command(sweep_to_angle);
+    return;
+  }
+  long span = (long)sweep_to_angle - (long)sweep_from_angle;
+  int angle = sweep_from_angle + (int)(span * (long)elapsed / (long)sweep_duration);
+  servo_command(angle);
+}
+
+void send_current_look_state() {
+  if (state == STATE_HUMAN || state == STATE_TO_HUMAN) {
+    Serial.println("LOOK_HUMAN");
+  } else {
+    Serial.println("LOOK_SELF");
+  }
+}
+
+void motion_off() {
+  if (servo_motion_enabled) {
+    servo_motion_enabled = false;
+    servo.detach();
+    Serial.println("MOTION_OFF_OK");
+  } else {
+    Serial.println("MOTION_ALREADY_OFF");
+  }
+
+  send_current_look_state();
+}
+
+void motion_on() {
+  if (!servo_motion_enabled) {
+    servo_motion_enabled = true;
+    servo.attach(SERVO_PIN);
+    servo.write(angle_for_state(state));
+    servo_current_angle = angle_for_state(state);
+    Serial.println("MOTION_ON_OK");
+  } else {
+    Serial.println("MOTION_ALREADY_ON");
+  }
+
+  send_current_look_state();
+}
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  Serial.setTimeout(20);
+
+  while (!Serial && millis() < 2000) {}
+
+  servo.attach(SERVO_PIN);
+  servo.write(ANGLE_SELF);
+  servo_current_angle = ANGLE_SELF;
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  tof.begin();
+  tof.VL53L4CD_Off();
+
+  if (tof.InitSensor() != 0) {
+    Serial.println("TOF_FAIL");
+    tof_ok = false;
+  } else {
+    tof.VL53L4CD_SetRangeTiming(50, 0);
+    tof.VL53L4CD_StartRanging();
+    tof_ok = true;
+    Serial.println("READY");
+    Serial.println("LOOK_SELF");
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  /*
+   * ToF 永远继续工作。
+   * 即使 servo_motion_enabled == false，
+   * 这里仍然持续读取距离，并继续推进状态机。
+   */
+  if (tof_ok) {
+    uint8_t data_ready = 0;
+    tof.VL53L4CD_CheckForDataReady(&data_ready);
+
+    if (data_ready) {
+      VL53L4CD_Result_t results;
+      tof.VL53L4CD_GetResult(&results);
+      tof.VL53L4CD_ClearInterrupt();
+
+      last_distance = results.distance_mm;
+      last_status = results.range_status;
+    }
+  }
+
+  // status 无效，或读数过近（< TOF_MIN_VALID_MM，多为盖板串扰幻影）→ 当作无目标(9999)
+  uint16_t effective_distance =
+      (last_status == 0 && last_distance >= TOF_MIN_VALID_MM) ? last_distance : 9999;
+
+  if (DEBUG_PRINT && (now - last_debug_print_at >= DEBUG_INTERVAL_MS)) {
+    last_debug_print_at = now;
+
+    Serial.print("dist=");
+    Serial.print(last_distance);
+    Serial.print("mm  status=");
+    Serial.print(last_status);
+    Serial.print("  effective=");
+    Serial.print(effective_distance);
+    Serial.print("  state=");
+    Serial.print(state_name(state));
+    Serial.print("  motion=");
+    Serial.print(servo_motion_enabled ? "ON" : "OFF");
+    Serial.print("  hold=");
+    Serial.println(hold_self_until_release ? "ON" : "OFF");
+  }
+
+  if (hold_self_until_release && effective_distance > TOF_RELEASE_MM) {
+    hold_self_until_release = false;
+    Serial.println("HOLD_SELF_RELEASED");
+  }
+
+  /*
+   * 读取 Python 发来的命令
+   */
+  if (Serial.available()) {
+    String incoming = Serial.readStringUntil('\n');
+    incoming.trim();
+
+    if (incoming == "GO_SELF") {
+      if (state == STATE_HUMAN || state == STATE_TO_HUMAN) {
+        start_sweep(ANGLE_SELF, SERVO_MOVE_SELF_MS);
+        state = STATE_TO_SELF;
+        Serial.println("GO_SELF_OK");
+      } else {
+        Serial.println("GO_SELF_IGNORED");
+      }
+    }
+
+    else if (incoming == "GO_SELF_HOLD") {
+      hold_self_until_release = true;
+      start_sweep(ANGLE_SELF, SERVO_MOVE_SELF_MS);
+      state = STATE_TO_SELF;
+      Serial.println("GO_SELF_HOLD_OK");
+    }
+
+    else if (incoming == "UNITING_ON") {
+      motion_off();
+    }
+
+    else if (incoming == "UNITING_OFF") {
+      motion_on();
+    }
+
+    else if (incoming == "MOTION_OFF") {
+      motion_off();
+    }
+
+    else if (incoming == "MOTION_ON") {
+      motion_on();
+    }
+
+    else if (incoming == "PING") {
+      Serial.println("PONG");
+      send_current_look_state();
+    }
+
+    else if (incoming.length() > 0) {
+      Serial.print("UNKNOWN_CMD:");
+      Serial.println(incoming);
+    }
+  }
+
+  /*
+   * 主状态机
+   *
+   * 注意：
+   * servo_command() 在 motion off 时不会真的转动舵机，
+   * 但 state 仍然会变化。
+   * 所以 UNITING 期间有人靠近，state 仍然可以变成 HUMAN，
+   * Python 仍然可以收到 LOOK_HUMAN。
+   */
+  switch (state) {
+    case STATE_SELF:
+      if (!hold_self_until_release && effective_distance > 0 && effective_distance < TOF_TRIGGER_MM) {
+        start_sweep(ANGLE_HUMAN, SERVO_MOVE_HUMAN_MS);
+        state = STATE_TO_HUMAN;
+      }
+      break;
+
+    case STATE_TO_HUMAN:
+      update_sweep();   // 在 SERVO_MOVE_HUMAN_MS 内逐步转向看人
+      if (now - transition_started_at >= sweep_duration) {
+        Serial.println("LOOK_HUMAN");
+        state = STATE_HUMAN;
+      }
+      break;
+
+    case STATE_HUMAN:
+      if (effective_distance > TOF_RELEASE_MM) {
+        start_sweep(ANGLE_SELF, SERVO_MOVE_SELF_MS);
+        state = STATE_TO_SELF;
+      }
+      break;
+
+    case STATE_TO_SELF:
+      update_sweep();   // 在 SERVO_MOVE_SELF_MS 内逐步转回看自己
+      if (now - transition_started_at >= sweep_duration) {
+        Serial.println("LOOK_SELF");
+        state = STATE_SELF;
+      }
+      break;
+  }
+}

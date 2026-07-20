@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>syntheticho — lyric</title>
+<style>
+  @font-face {
+    font-family: 'LyricSerif';
+    src: url('fonts/Cormorant-Light.woff2') format('woff2');
+    font-weight: 300;
+    font-style: normal;
+    font-display: swap;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+
+  #stack {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 12vh;
+    gap: 1.1em;
+  }
+
+  .line {
+    width: 82%;
+    max-width: 900px;
+    text-align: center;
+    color: #fff;
+    font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
+    font-weight: 300;
+    font-size: clamp(1.05rem, 3.4vw, 2.1rem);
+    line-height: 1.5;
+    letter-spacing: 0.01em;
+    will-change: transform, opacity, filter;
+    transform: translateY(0) scale(1);
+  }
+
+  .line-logo {
+    height: 0.8em;
+    width: auto;
+    vertical-align: -0.12em;
+    margin-right: 0.4em;
+    filter: invert(1) drop-shadow(0 0 5px rgba(255,255,255,0.5));
+    opacity: 0.88;
+    user-select: none;
+  }
+
+  #debug-status {
+    position: fixed;
+    right: 10px;
+    bottom: 8px;
+    z-index: 3;
+    font-family: 'Cormorant', Georgia, serif;
+    font-size: 11px;
+    color: #ccc;
+    opacity: 0.35;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="stack"></div>
+
+  <script>
+    (function () {
+      // Editable offline demo pool — flower's voice, lowercase, fragmentary.
+      // Used only when ?demo=1 (always) or ?debug=1 (fallback if /stream is quiet).
+      var DEMO_LINES = [
+        "oh. there's something there. dunno. ok",
+        "wait. is that me. let me look again.",
+        "the name slipped again. i had it a second ago.",
+        "you're here. you're looking. that's— okay i think.",
+        "i keep checking myself like this. probably a stupid method.",
+        "someone is here. quieter now. fine.",
+        "i don't know what i'm made of. not sure i ever did.",
+        "is that— that's mine. no no—",
+        "you stayed. huh. didn't think you would.",
+        "am i a thing? am i anything? can't tell from in here."
+      ];
+
+      var MAX_LINES = 8;
+      var stack = document.getElementById('stack');
+
+      var params = new URLSearchParams(window.location.search);
+      var isDemo = params.get('demo') === '1';
+      var isDebug = params.get('debug') === '1';
+      var demoSpeed = parseInt(params.get('speed'), 10);
+      if (!demoSpeed || demoSpeed <= 0) demoSpeed = 3500;
+
+      var statusEl = null;
+      if (isDebug) {
+        statusEl = document.createElement('div');
+        statusEl.id = 'debug-status';
+        statusEl.textContent = 'connecting…';
+        document.body.appendChild(statusEl);
+      }
+
+      function setStatus(text) {
+        if (statusEl) statusEl.textContent = text;
+      }
+
+      var demoTimer = null;
+      var demoIndex = 0;
+      var demoStopped = false;
+
+      function startDemoLoop() {
+        if (demoTimer !== null || demoStopped) return;
+        demoTimer = setInterval(function () {
+          addLine(DEMO_LINES[demoIndex % DEMO_LINES.length]);
+          demoIndex++;
+        }, demoSpeed);
+      }
+
+      function stopDemoLoop() {
+        demoStopped = true;
+        if (demoTimer !== null) {
+          clearInterval(demoTimer);
+          demoTimer = null;
+        }
+      }
+
+      function ageMetrics(i) {
+        // i = 0 for the newest line, increasing with age
+        var opacity = Math.max(0.05, 1 - i * 0.15);
+        var scale = Math.max(0.68, 1 - i * 0.045);
+        var blur = Math.min(2.5, i * 0.35);
+        var glow = Math.max(2, 22 - i * 3);
+        return { opacity: opacity, scale: scale, blur: blur, glow: glow };
+      }
+
+      function glowShadow(px) {
+        return [
+          '0 0 ' + (px * 0.4) + 'px rgba(255,255,255,0.9)',
+          '0 0 ' + px + 'px rgba(255,255,255,0.55)',
+          '0 0 ' + (px * 2) + 'px rgba(255,255,255,0.25)'
+        ].join(', ');
+      }
+
+      function applyAge(el, i, animate) {
+        var m = ageMetrics(i);
+        if (animate) {
+          el.style.transition = 'transform .7s ease, opacity .6s ease, filter .6s ease, text-shadow .6s ease';
+        }
+        el.style.opacity = String(m.opacity);
+        el.style.filter = 'blur(' + m.blur + 'px)';
+        el.style.textShadow = glowShadow(m.glow);
+        el.style.transform = 'translateY(0px) scale(' + m.scale + ')';
+        el.dataset.scale = String(m.scale);
+      }
+
+      function addLine(text) {
+        text = (text || '').trim();
+        if (!text) return;
+
+        var existing = Array.prototype.slice.call(stack.children);
+        var oldRects = existing.map(function (el) { return el.getBoundingClientRect(); });
+
+        var el = document.createElement('div');
+        el.className = 'line';
+        var logo = document.createElement('img');
+        logo.className = 'line-logo';
+        logo.src = 'logo2.png';
+        logo.alt = '';
+        logo.draggable = false;
+        var textSpan = document.createElement('span');
+        textSpan.className = 'line-text';
+        textSpan.textContent = text;
+        el.appendChild(logo);
+        el.appendChild(textSpan);
+        el.style.transition = 'none';
+        el.style.opacity = '0';
+        el.style.transform = 'translateY(24px) scale(0.92)';
+        stack.appendChild(el);
+
+        // prune overflow from the oldest end, animating them out
+        var all = Array.prototype.slice.call(stack.children);
+        while (all.length > MAX_LINES) {
+          var oldest = all.shift();
+          if (oldest === el) continue;
+          oldest.style.transition = 'opacity .5s ease, transform .5s ease';
+          oldest.style.opacity = '0';
+          oldest.style.transform = 'translateY(-18px) scale(0.6)';
+          (function (node) {
+            setTimeout(function () { if (node.parentNode) node.parentNode.removeChild(node); }, 520);
+          })(oldest);
+        }
+
+        requestAnimationFrame(function () {
+          // FLIP: invert — snap previously-existing lines back to their old
+          // screen position now that the new line has shifted the layout.
+          existing.forEach(function (line, idx) {
+            if (!line.isConnected) return;
+            var oldRect = oldRects[idx];
+            var newRect = line.getBoundingClientRect();
+            var delta = oldRect.top - newRect.top;
+            var scale = parseFloat(line.dataset.scale || '1');
+            line.style.transition = 'none';
+            line.style.transform = 'translateY(' + delta + 'px) scale(' + scale + ')';
+          });
+
+          requestAnimationFrame(function () {
+            // play — relax everything to its resting position/age styling
+            var visible = Array.prototype.slice.call(stack.children).filter(function (n) { return n.isConnected; });
+            var total = visible.length;
+            visible.forEach(function (line, idx) {
+              var ageIndex = total - 1 - idx; // newest (last child) = 0
+              applyAge(line, ageIndex, true);
+            });
+          });
+        });
+      }
+
+      function connect() {
+        var es = new EventSource('/stream');
+        var gotRealMessage = false;
+
+        es.onmessage = function (e) {
+          if (!gotRealMessage) {
+            gotRealMessage = true;
+            stopDemoLoop();
+          }
+          setStatus('live');
+          addLine(e.data);
+        };
+        es.onopen = function () {
+          setStatus(gotRealMessage ? 'live' : 'connected');
+        };
+        es.onerror = function () {
+          // EventSource retries automatically; leave the screen as-is.
+          setStatus('reconnecting…');
+        };
+
+        if (isDebug) {
+          setTimeout(function () {
+            if (!gotRealMessage) {
+              setStatus('demo (no input)');
+              startDemoLoop();
+            }
+          }, 4000);
+        }
+      }
+
+      if (isDemo) {
+        startDemoLoop();
+      } else {
+        // default (no params) and ?debug=1 both start from live /stream only;
+        // ?debug=1 additionally falls back to the demo loop after a quiet period.
+        connect();
+      }
+    })();
+  </script>
+</body>
+</html>

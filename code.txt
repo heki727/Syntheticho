@@ -1,0 +1,3 @@
+source ~/yolo_env/bin/activate
+cd "/Users/heki/Desktop/final Syntheticho/final_llm"
+python hand_osc.py
