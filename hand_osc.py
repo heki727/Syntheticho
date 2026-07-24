@@ -47,6 +47,10 @@ POINT_LANDMARK = 8  # index fingertip. Palm-center alternative: average
 MIRROR_X = True   # selfie camera → mirror x so audience left/right matches
 SMOOTH = 0.5       # EMA smoothing, 0..1 (0 = off, higher = smoother/laggier)
 
+HAND_OFF_FRAMES = 8  # consecutive no-hand frames before hand_on latches to 0.0
+                      # (~0.27s @ 30fps) — absorbs single-frame MediaPipe dropouts
+                      # so /handon doesn't flicker 0/1 on brief misdetections.
+
 OSC_IP = "127.0.0.1"
 OSC_PORT = 10727
 FPS = 30
@@ -107,6 +111,7 @@ def main():
     frame_interval = 1.0 / FPS
     smoothed_x = None
     smoothed_y = None
+    hand_off_streak = HAND_OFF_FRAMES  # start "off" so no false hand-on at launch
 
     print(f"[hand_osc] streaming /handx /handy /handon → {OSC_IP}:{OSC_PORT}")
     print("[hand_osc] Ctrl+C to stop")
@@ -124,7 +129,6 @@ def main():
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = hands.process(rgb)
 
-                hand_on = 0.0
                 if results.multi_hand_landmarks:
                     hand_landmarks = results.multi_hand_landmarks[0]
                     raw_x, raw_y = get_point_xy(hand_landmarks)
@@ -137,14 +141,20 @@ def main():
                         smoothed_x = SMOOTH * smoothed_x + (1.0 - SMOOTH) * raw_x
                         smoothed_y = SMOOTH * smoothed_y + (1.0 - SMOOTH) * raw_y
 
+                    hand_off_streak = 0
                     hand_on = 1.0
 
                     if SHOW_WINDOW:
                         mp_drawing.draw_landmarks(
                             frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
                         )
-                # else: hand not detected this frame — keep last smoothed_x/y
-                # (they simply aren't updated), only hand_on drops to 0.0.
+                else:
+                    # hand not detected this frame — keep last smoothed_x/y
+                    # (they simply aren't updated). Only latch hand_on to 0.0
+                    # after HAND_OFF_FRAMES consecutive misses, so a single
+                    # dropped frame doesn't flip /handon back and forth.
+                    hand_off_streak += 1
+                    hand_on = 0.0 if hand_off_streak >= HAND_OFF_FRAMES else 1.0
 
                 if smoothed_x is not None:
                     osc_client.send_message("/handx", float(smoothed_x))
