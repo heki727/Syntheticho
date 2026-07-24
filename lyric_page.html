@@ -35,8 +35,8 @@
     flex-direction: column;
     justify-content: flex-end;
     align-items: center;
-    padding-bottom: 8vh;
-    gap: 1.1em;
+    padding-bottom: 3vh;
+    gap: 0.5em;
   }
 
   #particle-canvas {
@@ -74,8 +74,8 @@
     color: #fff;
     font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
     font-weight: 300;
-    font-size: clamp(0.95rem, 2.6vw, 1.5rem);
-    line-height: 1.35;
+    font-size: clamp(1.5rem, 5vw, 2.4rem);
+    line-height: 1.2;
     letter-spacing: 0.01em;
     will-change: transform, opacity, filter;
     transform: translateY(0) scale(1);
@@ -188,6 +188,26 @@
       var DISPERSED_HOLD_SECONDS = 2; // pause after dispersing before auto-regather
       var GRACE_MS = 5000;            // wait this long for a real hand signal before auto-looping
 
+      // Spring-damper motion (GATHER + FORMED only) — replaces the old linear
+      // lerp so particles overshoot their target and ring down instead of
+      // snapping straight to it.
+      var STIFFNESS = 0.05;     // spring pull toward target; higher = snappier/more overshoot
+      var DAMPING = 0.78;       // velocity retained per frame; closer to 1 = longer ringing
+      var SETTLE_SPEED = 0.15;  // GATHER->FORMED once the fastest particle drops below this
+
+      // Ripple: a sine displacement spreading outward from the hero text's
+      // center, amplitude-scaled by an envelope that's strong right after a
+      // regather and decays to a faint idle level while FORMED.
+      var WAVE_AMP = 4;         // px, at envelope = 1
+      var WAVE_FREQ = 0.025;    // spatial frequency, radians per px of distance
+      var WAVE_SPEED = 0.006;   // temporal frequency, radians per ms
+      var RIPPLE_FLOOR = 0.12;  // idle envelope level once settled (persists in FORMED)
+      var RIPPLE_DECAY = 0.035; // per-frame approach rate toward RIPPLE_FLOOR
+
+      var rippleEnvelope = 1.0;
+      var heroCenterX = 0;
+      var heroCenterY = 0;
+
       var canvas = document.getElementById('particle-canvas');
       var ctx = canvas.getContext('2d');
       var DPR = Math.min(window.devicePixelRatio || 1, 2);
@@ -214,6 +234,10 @@
             p.vy = -(1.2 + Math.random() * 1.8);
             p.vx = (Math.random() - 0.5) * 1.4;
           });
+        } else if (s === STATE_GATHER) {
+          // Fresh regather (initial load, forceRegather, or a hand-off edge)
+          // gets one strong ripple that then rings down toward the idle floor.
+          rippleEnvelope = 1.0;
         }
       }
 
@@ -251,6 +275,8 @@
       function buildTargets() {
         var w = window.innerWidth;
         var bandH = Math.round(window.innerHeight * 0.4);
+        heroCenterX = w / 2;
+        heroCenterY = bandH / 2;
         var off = document.createElement('canvas');
         off.width = w;
         off.height = bandH;
@@ -315,23 +341,40 @@
         if (!handSignalSeen) autoLoopActive = true;
       }, GRACE_MS);
 
+      function applySpring(now) {
+        // Spring-damper integration toward (target + ripple), shared by
+        // GATHER and FORMED. Returns the fastest particle's speed so GATHER
+        // can tell when things have settled instead of just checking position.
+        var maxSpeed = 0;
+        particles.forEach(function (p) {
+          var dx0 = p.tx - heroCenterX;
+          var dy0 = p.ty - heroCenterY;
+          var d = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+          var wave = Math.sin(d * WAVE_FREQ - now * WAVE_SPEED) * WAVE_AMP * rippleEnvelope;
+          var ax = (p.tx - p.x) * STIFFNESS;
+          var ay = (p.ty + wave - p.y) * STIFFNESS;
+          p.vx = (p.vx + ax) * DAMPING;
+          p.vy = (p.vy + ay) * DAMPING;
+          p.x += p.vx;
+          p.y += p.vy;
+          var speed = Math.abs(p.vx) + Math.abs(p.vy);
+          if (speed > maxSpeed) maxSpeed = speed;
+        });
+        return maxSpeed;
+      }
+
       function update(now) {
         var t = (now - stateStartTime) / 1000;
         if (state === STATE_GATHER) {
-          var ease = 0.06;
-          var allClose = true;
-          particles.forEach(function (p) {
-            p.x += (p.tx - p.x) * ease;
-            p.y += (p.ty - p.y) * ease;
-            if (Math.abs(p.tx - p.x) > 1.5 || Math.abs(p.ty - p.y) > 1.5) allClose = false;
-          });
-          if (allClose || t > 3.2) setState(STATE_FORMED);
+          rippleEnvelope += (RIPPLE_FLOOR - rippleEnvelope) * RIPPLE_DECAY;
+          var maxSpeed = applySpring(now);
+          // Settled (fastest particle below threshold) or timed out — either
+          // way move on, so an overshoot ringing longer than expected can
+          // never get the whole page stuck in GATHER.
+          if (maxSpeed < SETTLE_SPEED || t > 3.2) setState(STATE_FORMED);
         } else if (state === STATE_FORMED) {
-          var breathe = Math.sin(now / 900) * 1.5;
-          particles.forEach(function (p) {
-            p.x += (p.tx - p.x) * 0.12;
-            p.y += (p.ty + breathe - p.y) * 0.12;
-          });
+          rippleEnvelope += (RIPPLE_FLOOR - rippleEnvelope) * RIPPLE_DECAY;
+          applySpring(now);
           if (autoLoopActive && t > HOLD_SECONDS) setState(STATE_DISPERSE);
         } else if (state === STATE_DISPERSE) {
           particles.forEach(function (p) {
@@ -487,7 +530,7 @@
       function ageMetrics(i) {
         // i = 0 for the newest line, increasing with age
         var opacity = Math.max(0.05, 1 - i * 0.15);
-        var scale = Math.max(0.68, 1 - i * 0.045);
+        var scale = Math.max(0.82, 1 - i * 0.025);
         var blur = Math.min(2.5, i * 0.35);
         var glow = Math.max(2, 22 - i * 3);
         return { opacity: opacity, scale: scale, blur: blur, glow: glow };
