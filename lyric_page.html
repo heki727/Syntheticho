@@ -26,7 +26,10 @@
 
   #stack {
     position: fixed;
-    inset: 0;
+    top: 50%;
+    left: 0;
+    right: 0;
+    bottom: 0;
     z-index: 1;
     display: flex;
     flex-direction: column;
@@ -35,6 +38,34 @@
     padding-bottom: 12vh;
     gap: 1.1em;
   }
+
+  #particle-canvas {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    display: block;
+    pointer-events: none;
+  }
+
+  .hud-mark {
+    position: fixed;
+    width: 22px;
+    height: 22px;
+    z-index: 4;
+    opacity: 0.32;
+    pointer-events: none;
+  }
+  .hud-mark::before, .hud-mark::after {
+    content: '';
+    position: absolute;
+    background: #fff;
+  }
+  .hud-mark::before { top: 50%; left: 0; right: 0; height: 1px; transform: translateY(-50%); }
+  .hud-mark::after { left: 50%; top: 0; bottom: 0; width: 1px; transform: translateX(-50%); }
+  .hud-tl { top: 18px; left: 18px; }
+  .hud-tr { top: 18px; right: 18px; }
+  .hud-bl { bottom: 18px; left: 18px; }
+  .hud-br { bottom: 18px; right: 18px; }
 
   .line {
     width: 82%;
@@ -75,7 +106,256 @@
 </style>
 </head>
 <body>
+  <canvas id="particle-canvas"></canvas>
+  <div class="hud-mark hud-tl" aria-hidden="true"></div>
+  <div class="hud-mark hud-tr" aria-hidden="true"></div>
+  <div class="hud-mark hud-bl" aria-hidden="true"></div>
+  <div class="hud-mark hud-br" aria-hidden="true"></div>
+
   <div id="stack"></div>
+
+  <script>
+    (function () {
+      // Particle hero text: gathers into HERO_TEXT in the top ~40% band,
+      // glitches while formed, and dissolves/reforms on hand-state edges
+      // (from the SSE "hand" event) or on a timed loop when no hand signal
+      // has ever been seen. Fully independent of the monologue stack below —
+      // shares only the page and the /stream connection's "hand" event.
+      var HERO_TEXT = 'touch me i need u';
+
+      var SAMPLE_STEP = 5;
+      var HOLD_SECONDS = 4;          // formed "breathing" hold before auto-disperse
+      var DISPERSED_HOLD_SECONDS = 2; // pause after dispersing before auto-regather
+      var GRACE_MS = 5000;            // wait this long for a real hand signal before auto-looping
+
+      var canvas = document.getElementById('particle-canvas');
+      var ctx = canvas.getContext('2d');
+      var DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+      var STATE_GATHER = 'gather';
+      var STATE_FORMED = 'formed';
+      var STATE_DISPERSE = 'disperse';
+      var STATE_SCATTERED = 'scattered';
+
+      var state = STATE_GATHER;
+      var stateStartTime = performance.now();
+      var particles = [];
+      var targets = [];
+
+      var handSignalSeen = false;
+      var autoLoopActive = false;
+      var lastHand = null;
+
+      function setState(s) {
+        state = s;
+        stateStartTime = performance.now();
+        if (s === STATE_DISPERSE) {
+          particles.forEach(function (p) {
+            p.vy = -(1.2 + Math.random() * 1.8);
+            p.vx = (Math.random() - 0.5) * 1.4;
+          });
+        }
+      }
+
+      function randomScatterPoint() {
+        var w = window.innerWidth, h = window.innerHeight;
+        return {
+          x: Math.random() * w,
+          y: h * 0.55 + Math.random() * h * 0.6
+        };
+      }
+
+      function syncParticleCount() {
+        var next = [];
+        for (var i = 0; i < targets.length; i++) {
+          var t = targets[i];
+          var prev = particles[i];
+          var scatter = randomScatterPoint();
+          next.push({
+            x: prev ? prev.x : scatter.x,
+            y: prev ? prev.y : scatter.y,
+            tx: t.x,
+            ty: t.y,
+            sx: scatter.x,
+            sy: scatter.y,
+            vx: 0,
+            vy: 0
+          });
+        }
+        particles = next;
+      }
+
+      function buildTargets() {
+        var w = window.innerWidth;
+        var bandH = Math.round(window.innerHeight * 0.4);
+        var off = document.createElement('canvas');
+        off.width = w;
+        off.height = bandH;
+        var octx = off.getContext('2d');
+        var fontSize = Math.max(28, Math.min(w * 0.055, 92));
+        octx.font = '300 ' + fontSize + 'px LyricSerif, Cormorant, Georgia, serif';
+        octx.fillStyle = '#fff';
+        octx.textAlign = 'center';
+        octx.textBaseline = 'middle';
+        octx.fillText(HERO_TEXT, w / 2, bandH / 2);
+
+        var data = octx.getImageData(0, 0, w, bandH).data;
+        var pts = [];
+        for (var y = 0; y < bandH; y += SAMPLE_STEP) {
+          for (var x = 0; x < w; x += SAMPLE_STEP) {
+            var idx = (y * w + x) * 4 + 3;
+            if (data[idx] > 128) pts.push({ x: x, y: y });
+          }
+        }
+        targets = pts;
+        syncParticleCount();
+      }
+
+      function resizeCanvas() {
+        canvas.width = window.innerWidth * DPR;
+        canvas.height = window.innerHeight * DPR;
+        canvas.style.width = window.innerWidth + 'px';
+        canvas.style.height = window.innerHeight + 'px';
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        buildTargets();
+      }
+
+      function forceDisperse() {
+        if (state === STATE_DISPERSE || state === STATE_SCATTERED) return;
+        setState(STATE_DISPERSE);
+      }
+
+      function forceRegather() {
+        particles.forEach(function (p) {
+          p.x = p.sx;
+          p.y = p.sy;
+          p.vx = 0;
+          p.vy = 0;
+        });
+        setState(STATE_GATHER);
+      }
+
+      window.__onLyricHandEvent = function (e) {
+        var newHand = e.data === '1' ? 1 : 0;
+        if (!handSignalSeen) {
+          handSignalSeen = true;
+          autoLoopActive = false;
+        }
+        if (lastHand !== null && newHand !== lastHand) {
+          if (newHand === 1) forceDisperse();
+          else forceRegather();
+        }
+        lastHand = newHand;
+      };
+
+      setTimeout(function () {
+        if (!handSignalSeen) autoLoopActive = true;
+      }, GRACE_MS);
+
+      function update(now) {
+        var t = (now - stateStartTime) / 1000;
+        if (state === STATE_GATHER) {
+          var ease = 0.06;
+          var allClose = true;
+          particles.forEach(function (p) {
+            p.x += (p.tx - p.x) * ease;
+            p.y += (p.ty - p.y) * ease;
+            if (Math.abs(p.tx - p.x) > 1.5 || Math.abs(p.ty - p.y) > 1.5) allClose = false;
+          });
+          if (allClose || t > 3.2) setState(STATE_FORMED);
+        } else if (state === STATE_FORMED) {
+          var breathe = Math.sin(now / 900) * 1.5;
+          particles.forEach(function (p) {
+            p.x += (p.tx - p.x) * 0.12;
+            p.y += (p.ty + breathe - p.y) * 0.12;
+          });
+          if (autoLoopActive && t > HOLD_SECONDS) setState(STATE_DISPERSE);
+        } else if (state === STATE_DISPERSE) {
+          particles.forEach(function (p) {
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy -= 0.02;
+          });
+          if (t > 1.6) setState(STATE_SCATTERED);
+        } else if (state === STATE_SCATTERED) {
+          if (autoLoopActive && t > DISPERSED_HOLD_SECONDS) forceRegather();
+        }
+      }
+
+      var sliceBand = { y0: 0, y1: 0, offset: 0, cycleStart: -1 };
+      function glitchSliceActive(now) {
+        var cycle = now % 2600;
+        if (cycle < 90) {
+          var n = Math.floor(now / 2600);
+          if (sliceBand.cycleStart !== n) {
+            sliceBand.cycleStart = n;
+            var h = window.innerHeight * 0.4;
+            sliceBand.y0 = Math.random() * h * 0.7;
+            sliceBand.y1 = sliceBand.y0 + 8 + Math.random() * 24;
+            sliceBand.offset = (Math.random() > 0.5 ? 1 : -1) * (4 + Math.random() * 10);
+          }
+          return true;
+        }
+        return false;
+      }
+
+      function drawScanlines(now, alpha) {
+        var w = window.innerWidth;
+        var h = window.innerHeight * 0.42;
+        ctx.save();
+        ctx.globalAlpha = 0.06 * alpha;
+        ctx.fillStyle = '#fff';
+        var offset = (now / 40) % 6;
+        for (var y = offset; y < h; y += 6) ctx.fillRect(0, y, w, 1);
+        ctx.restore();
+      }
+
+      function render(now) {
+        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+        if (state === STATE_SCATTERED) return;
+
+        var alpha = 1;
+        if (state === STATE_DISPERSE) {
+          alpha = Math.max(0, 1 - (now - stateStartTime) / 1600);
+        } else if (state === STATE_GATHER) {
+          alpha = Math.min(1, (now - stateStartTime) / 1000);
+        }
+
+        var doGlitch = state === STATE_FORMED;
+        var sliceActive = doGlitch && glitchSliceActive(now);
+        var rgbOffset = doGlitch ? 1.4 : 0;
+
+        particles.forEach(function (p) {
+          var dx = 0;
+          if (sliceActive && p.y > sliceBand.y0 && p.y < sliceBand.y1) dx = sliceBand.offset;
+          var px = p.x + dx, py = p.y;
+          if (rgbOffset > 0) {
+            ctx.fillStyle = 'rgba(255,60,60,' + (0.5 * alpha) + ')';
+            ctx.fillRect(px - rgbOffset, py, 1.6, 1.6);
+            ctx.fillStyle = 'rgba(60,180,255,' + (0.5 * alpha) + ')';
+            ctx.fillRect(px + rgbOffset, py, 1.6, 1.6);
+            ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
+            ctx.fillRect(px, py, 1.6, 1.6);
+          } else {
+            ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
+            ctx.fillRect(px, py, 1.6, 1.6);
+          }
+        });
+
+        if (doGlitch) drawScanlines(now, alpha);
+      }
+
+      function tick(now) {
+        update(now);
+        render(now);
+        requestAnimationFrame(tick);
+      }
+
+      window.addEventListener('resize', resizeCanvas);
+      resizeCanvas();
+      requestAnimationFrame(tick);
+    })();
+  </script>
 
   <script>
     (function () {
@@ -229,6 +509,10 @@
       function connect() {
         var es = new EventSource('/stream');
         var gotRealMessage = false;
+
+        es.addEventListener('hand', function (e) {
+          if (window.__onLyricHandEvent) window.__onLyricHandEvent(e);
+        });
 
         es.onmessage = function (e) {
           if (!gotRealMessage) {

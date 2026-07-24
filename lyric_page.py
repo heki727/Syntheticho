@@ -18,11 +18,27 @@ import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    from pythonosc import dispatcher as _osc_dispatcher
+    from pythonosc import osc_server as _osc_server
+    _HAND_OSC_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover - degrades silently if python-osc missing
+    _osc_dispatcher = None
+    _osc_server = None
+    _HAND_OSC_IMPORT_ERROR = _e
+
 # ======================= 可调参数 =======================
 LYRIC_ENABLE = os.environ.get("LYRIC_ENABLE", "1") == "1"   # 总开关，默认开
 LYRIC_PORT = int(os.environ.get("LYRIC_PAGE_PORT", "8137"))
 LYRIC_HOST = os.environ.get("LYRIC_PAGE_HOST", "127.0.0.1")
 LYRIC_SHOW_REASSEMBLE = os.environ.get("LYRIC_SHOW_REASSEMBLE", "0") == "1"  # 是否显示 reunite 阶段的机械读数句
+
+# hand-state side channel: hand_osc.py (or any OSC sender) posts /handon
+# (1.0 = hand present, 0.0 = none) here; we relay it to the page over SSE
+# as a named "hand" event, kept separate from the monologue stream.
+LYRIC_HAND_OSC_ENABLE = os.environ.get("LYRIC_HAND_OSC_ENABLE", "1") == "1"
+LYRIC_HAND_OSC_PORT = int(os.environ.get("LYRIC_HAND_OSC_PORT", "10728"))
+LYRIC_HAND_OSC_ADDR = os.environ.get("LYRIC_HAND_OSC_ADDR", "/handon")
 # ==========================================================
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +69,10 @@ es.onmessage = function(e){ line.textContent = e.data; };
 
 _SUBSCRIBER_QUEUE_MAX = 20
 _HEARTBEAT_SECONDS = 15
+
+# Sentinel tuple shape put on a subscriber queue to mark a hand-state frame,
+# distinct from the plain strings the monologue path already queues.
+_HAND_EVENT_MARKER = "__lyric_hand__"
 
 _warned_once = {"start": False, "push": False, "stop": False}
 
@@ -140,9 +160,12 @@ class _LyricRequestHandler(BaseHTTPRequestHandler):
 
             while server.is_running():
                 try:
-                    text = client_queue.get(timeout=_HEARTBEAT_SECONDS)
-                    safe_text = text.replace("\r", " ").replace("\n", " ")
-                    self.wfile.write(f"data: {safe_text}\n\n".encode("utf-8"))
+                    item = client_queue.get(timeout=_HEARTBEAT_SECONDS)
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] == _HAND_EVENT_MARKER:
+                        self.wfile.write(f"event: hand\ndata: {item[1]}\n\n".encode("utf-8"))
+                    else:
+                        safe_text = item.replace("\r", " ").replace("\n", " ")
+                        self.wfile.write(f"data: {safe_text}\n\n".encode("utf-8"))
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                 self.wfile.flush()
@@ -189,6 +212,23 @@ class _LyricHTTPServer(ThreadingHTTPServer):
                 except queue.Full:
                     pass
 
+    def broadcast_hand(self, state):
+        payload = (_HAND_EVENT_MARKER, "1" if state else "0")
+        with self._subscribers_lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    pass
+
     def shutdown_all(self):
         self._running = False
         with self._subscribers_lock:
@@ -207,6 +247,10 @@ class LyricPage:
         self._server = None
         self._thread = None
         self._started = False
+        self._osc_server = None
+        self._osc_thread = None
+        self._last_hand_state = None
+        self._hand_state_lock = threading.Lock()
 
     def start(self):
         if self._started:
@@ -222,6 +266,48 @@ class LyricPage:
         except Exception as e:
             _warn_once("start", f"could not start page server ({e}); lyric page disabled")
             self._server = None
+            return
+        self._start_hand_osc()
+
+    def _start_hand_osc(self):
+        if not LYRIC_HAND_OSC_ENABLE:
+            return
+        if _osc_server is None or _osc_dispatcher is None:
+            _warn_once(
+                "hand_osc",
+                f"python-osc unavailable ({_HAND_OSC_IMPORT_ERROR}); hand-state input disabled",
+            )
+            return
+        try:
+            disp = _osc_dispatcher.Dispatcher()
+            disp.map(LYRIC_HAND_OSC_ADDR, self._on_hand_osc)
+            self._osc_server = _osc_server.ThreadingOSCUDPServer(
+                (LYRIC_HOST, LYRIC_HAND_OSC_PORT), disp
+            )
+            self._osc_thread = threading.Thread(target=self._osc_server.serve_forever, daemon=True)
+            self._osc_thread.start()
+            print(f"[LYRIC] hand-osc <- udp://{LYRIC_HOST}:{LYRIC_HAND_OSC_PORT}{LYRIC_HAND_OSC_ADDR}")
+        except Exception as e:
+            _warn_once("hand_osc", f"could not start hand-osc receiver ({e}); hand-state input disabled")
+            self._osc_server = None
+
+    def _on_hand_osc(self, _addr, *args):
+        if not args:
+            return
+        try:
+            value = float(args[0])
+        except (TypeError, ValueError):
+            return
+        state = value >= 0.5
+        with self._hand_state_lock:
+            if state == self._last_hand_state:
+                return
+            self._last_hand_state = state
+        if self._server is not None:
+            try:
+                self._server.broadcast_hand(state)
+            except Exception as e:
+                _warn_once("hand_osc", f"hand-state broadcast failed ({e})")
 
     def push(self, text, is_reassemble=False):
         if not self.enabled or self._server is None or not text:
@@ -234,6 +320,15 @@ class LyricPage:
             _warn_once("push", f"push failed ({e}); lyric page disabled")
 
     def stop(self):
+        if self._osc_server is not None:
+            try:
+                self._osc_server.shutdown()
+                self._osc_server.server_close()
+            except Exception as e:
+                _warn_once("stop", f"hand-osc shutdown error ({e})")
+            if self._osc_thread is not None:
+                self._osc_thread.join(timeout=2.0)
+            self._osc_server = None
         if self._server is None:
             return
         try:

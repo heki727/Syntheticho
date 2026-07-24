@@ -51,6 +51,10 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 10727
 FPS = 30
 
+LYRIC_OSC_IP = "127.0.0.1"
+LYRIC_OSC_PORT = 10728
+LYRIC_OSC_ENABLE = True  # also mirror /handon to the lyric page; flip off on-site if needed
+
 SHOW_WINDOW = False
 # ==========================================================================
 
@@ -76,6 +80,8 @@ def get_point_xy(hand_landmarks):
 
 def main():
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
+    lyric_client = SimpleUDPClient(LYRIC_OSC_IP, LYRIC_OSC_PORT) if LYRIC_OSC_ENABLE else None
+    lyric_warned = False
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -144,6 +150,13 @@ def main():
                     osc_client.send_message("/handx", float(smoothed_x))
                     osc_client.send_message("/handy", float(smoothed_y))
                 osc_client.send_message("/handon", float(hand_on))
+                if lyric_client is not None:
+                    try:
+                        lyric_client.send_message("/handon", float(hand_on))
+                    except Exception as e:
+                        if not lyric_warned:
+                            print(f"[hand_osc] lyric-page osc send failed (continuing): {e}")
+                            lyric_warned = True
 
                 if SHOW_WINDOW:
                     label = f"x={smoothed_x if smoothed_x is not None else 0:.3f} " \
