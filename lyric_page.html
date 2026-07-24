@@ -35,7 +35,7 @@
     flex-direction: column;
     justify-content: flex-end;
     align-items: center;
-    padding-bottom: 12vh;
+    padding-bottom: 8vh;
     gap: 1.1em;
   }
 
@@ -49,10 +49,10 @@
 
   .hud-mark {
     position: fixed;
-    width: 22px;
-    height: 22px;
+    width: 30px;
+    height: 30px;
     z-index: 4;
-    opacity: 0.32;
+    opacity: 0.68;
     pointer-events: none;
   }
   .hud-mark::before, .hud-mark::after {
@@ -60,8 +60,8 @@
     position: absolute;
     background: #fff;
   }
-  .hud-mark::before { top: 50%; left: 0; right: 0; height: 1px; transform: translateY(-50%); }
-  .hud-mark::after { left: 50%; top: 0; bottom: 0; width: 1px; transform: translateX(-50%); }
+  .hud-mark::before { top: 50%; left: 0; right: 0; height: 2px; transform: translateY(-50%); }
+  .hud-mark::after { left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); }
   .hud-tl { top: 18px; left: 18px; }
   .hud-tr { top: 18px; right: 18px; }
   .hud-bl { bottom: 18px; left: 18px; }
@@ -74,8 +74,8 @@
     color: #fff;
     font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
     font-weight: 300;
-    font-size: clamp(1.05rem, 3.4vw, 2.1rem);
-    line-height: 1.5;
+    font-size: clamp(0.95rem, 2.6vw, 1.5rem);
+    line-height: 1.35;
     letter-spacing: 0.01em;
     will-change: transform, opacity, filter;
     transform: translateY(0) scale(1);
@@ -103,6 +103,66 @@
     letter-spacing: 0.02em;
     pointer-events: none;
   }
+
+  /* CRT overlay: always-on old-TV texture sitting above everything
+     (including the corner HUD marks), so the whole page reads as one
+     CRT display. Pure CSS — no canvas, no JS driving it. */
+  #crt-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    pointer-events: none;
+    overflow: hidden;
+  }
+
+  .crt-scanlines {
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0) 0px,
+      rgba(0, 0, 0, 0) 2px,
+      rgba(0, 0, 0, 0.35) 3px
+    );
+  }
+
+  .crt-vignette {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.55) 100%);
+  }
+
+  .crt-rgbsplit {
+    position: absolute;
+    inset: 0;
+    box-shadow:
+      inset 2px 0 0 rgba(255, 0, 60, 0.035),
+      inset -2px 0 0 rgba(0, 120, 255, 0.035);
+  }
+
+  .crt-rollbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 80px;
+    top: 100%;
+    opacity: 0;
+    background: linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.08) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    animation: crt-roll 16s ease-in-out infinite;
+  }
+
+  @keyframes crt-roll {
+    0%   { top: 100%; opacity: 0; }
+    2%   { opacity: 0.9; }
+    12%  { top: -80px; opacity: 0.9; }
+    13%  { top: -80px; opacity: 0; }
+    100% { top: 100%; opacity: 0; }
+  }
 </style>
 </head>
 <body>
@@ -123,7 +183,7 @@
       // shares only the page and the /stream connection's "hand" event.
       var HERO_TEXT = 'touch me i need u';
 
-      var SAMPLE_STEP = 5;
+      var SAMPLE_STEP = 3;
       var HOLD_SECONDS = 4;          // formed "breathing" hold before auto-disperse
       var DISPERSED_HOLD_SECONDS = 2; // pause after dispersing before auto-regather
       var GRACE_MS = 5000;            // wait this long for a real hand signal before auto-looping
@@ -158,10 +218,13 @@
       }
 
       function randomScatterPoint() {
+        // Kept inside the upper band (same region as the hero text target
+        // zone) so gather/disperse motion never sweeps through the
+        // monologue's bottom-half territory.
         var w = window.innerWidth, h = window.innerHeight;
         return {
           x: Math.random() * w,
-          y: h * 0.55 + Math.random() * h * 0.6
+          y: h * 0.03 + Math.random() * h * 0.42
         };
       }
 
@@ -274,7 +337,7 @@
           particles.forEach(function (p) {
             p.x += p.vx;
             p.y += p.vy;
-            p.vy -= 0.02;
+            p.vy -= 0.01; // keeps accelerating upward — no gravity pull-back
           });
           if (t > 1.6) setState(STATE_SCATTERED);
         } else if (state === STATE_SCATTERED) {
@@ -325,6 +388,10 @@
         var sliceActive = doGlitch && glitchSliceActive(now);
         var rgbOffset = doGlitch ? 1.4 : 0;
 
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,255,255,0.7)';
+        ctx.shadowBlur = 6;
+
         particles.forEach(function (p) {
           var dx = 0;
           if (sliceActive && p.y > sliceBand.y0 && p.y < sliceBand.y1) dx = sliceBand.offset;
@@ -341,6 +408,8 @@
             ctx.fillRect(px, py, 1.6, 1.6);
           }
         });
+
+        ctx.restore();
 
         if (doGlitch) drawScanlines(now, alpha);
       }
@@ -374,7 +443,7 @@
         "am i a thing? am i anything? can't tell from in here."
       ];
 
-      var MAX_LINES = 8;
+      var MAX_LINES = 5;
       var stack = document.getElementById('stack');
 
       var params = new URLSearchParams(window.location.search);
@@ -549,5 +618,12 @@
       }
     })();
   </script>
+
+  <div id="crt-overlay" aria-hidden="true">
+    <div class="crt-scanlines"></div>
+    <div class="crt-vignette"></div>
+    <div class="crt-rgbsplit"></div>
+    <div class="crt-rollbar"></div>
+  </div>
 </body>
 </html>
