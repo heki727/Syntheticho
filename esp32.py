@@ -693,7 +693,8 @@ def build_esp32_camera_urls(value: str) -> list:
         # local webcam device index (e.g. "0"), not an ESP32-CAM URL
         return [value]
     if not value:
-        value = "http://192.168.4.1"
+        value = "0"
+        return [value]
     if not value.startswith(("http://", "https://")):
         value = "http://" + value
     value = value.rstrip("/")

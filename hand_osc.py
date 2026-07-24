@@ -11,7 +11,8 @@ Run:
     cd "/Users/heki/Desktop/final Syntheticho/final_llm"
     python hand_osc.py
 
-Calibration constants (top of file):
+Calibration con
+stants (top of file):
     CAMERA_INDEX        - cv2.VideoCapture index for the built-in camera.
     POINT_LANDMARK       - which MediaPipe hand landmark to use as "the"
                             hand position (default 8 = index fingertip).
