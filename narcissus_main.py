@@ -5,13 +5,14 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|rw_timeout;3000000")
 
 from pythonosc.udp_client import SimpleUDPClient
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import ThreadingOSCUDPServer
 from collections import deque
 from dotenv import load_dotenv
 from names import NAME_POOL
 from sentence_transformers import SentenceTransformer
 import anthropic
 import cv2
-import mediapipe as mp
 import numpy as np
 import time
 import threading
@@ -687,269 +688,10 @@ REASSEMBLE_POOL_PHASE_3 = [
     "self loaded. integrity: partial",
 ]
 
-def build_esp32_camera_urls(value: str) -> list:
-    value = value.strip()
-    if value.isdigit():
-        # local webcam device index (e.g. "0"), not an ESP32-CAM URL
-        return [value]
-    if not value:
-        value = "0"
-        return [value]
-    if not value.startswith(("http://", "https://")):
-        value = "http://" + value
-    value = value.rstrip("/")
-    value = value.replace("https://", "http://")
-
-    if value.endswith(("/stream", "/capture")):
-        return [value]
-
-    if ":81" in value:
-        base = value.replace(":81", "")
-        return [value + "/stream", base + "/stream", base + "/capture"]
-
-    return [value + "/stream", value + ":81/stream", value + "/capture"]
-
-_esp32_url_arg = sys.argv[1] if len(sys.argv) > 1 else ""
-ESP32_CAMERA_URLS = build_esp32_camera_urls(
-    _esp32_url_arg or os.environ.get("ESP32_CAMERA_URL", "")
-)
-esp32_source_index = 0
-ESP32_CAMERA_URL = ESP32_CAMERA_URLS[esp32_source_index]
-print(f"[ESP32] camera URL candidates: {ESP32_CAMERA_URLS}")
-
-def esp32_control_base_url(stream_url: str) -> str:
-    parsed = urllib.parse.urlparse(stream_url)
-    host = parsed.hostname or "192.168.4.1"
-    return f"{parsed.scheme or 'http'}://{host}"
-
-ESP32_CONTROL_BASE_URL = esp32_control_base_url(ESP32_CAMERA_URL)
-SET_CAMERA_PROFILE_ON_STARTUP = os.environ.get("SET_CAMERA_PROFILE_ON_STARTUP", "0") == "1"
-SET_LOWLIGHT_PARAMS_ON_STARTUP = os.environ.get("SET_LOWLIGHT_PARAMS_ON_STARTUP", "0") == "1"
-AUTO_CAMERA_QUALITY = os.environ.get("AUTO_CAMERA_QUALITY", "0") == "1"
-CAMERA_PROFILES = [
-    {"name": "qvga-fast", "framesize": 5, "quality": 16},
-    {"name": "vga-balanced", "framesize": 8, "quality": 10},
-    {"name": "svga-sharp", "framesize": 9, "quality": 12},
-]
-camera_profile_index = int(os.environ.get("CAMERA_PROFILE_INDEX", "1"))
-camera_good_fps_streak = 0
-FACE_DETECT_INTERVAL = float(os.environ.get("FACE_DETECT_INTERVAL", "0.30"))
-DETECT_GAMMA = float(os.environ.get("DETECT_GAMMA", "1.6"))
-_DETECT_GAMMA_LUT = np.array([
-    min(255, int((i / 255.0) ** (1.0 / DETECT_GAMMA) * 255))
-    for i in range(256)
-], dtype=np.uint8)
-
-def set_esp32_camera_profile(index: int, reason: str):
-    global camera_profile_index, camera_good_fps_streak
-
-    index = max(0, min(index, len(CAMERA_PROFILES) - 1))
-    profile = CAMERA_PROFILES[index]
-    try:
-        for var, val in (("framesize", profile["framesize"]), ("quality", profile["quality"])):
-            url = f"{ESP32_CONTROL_BASE_URL}/control?var={var}&val={val}"
-            with urllib.request.urlopen(url, timeout=1.0) as response:
-                response.read()
-        camera_profile_index = index
-        camera_good_fps_streak = 0
-        print(f"[ESP32] camera profile → {profile['name']} ({reason})")
-    except Exception as e:
-        print(f"[ESP32] camera profile change failed ({profile['name']}): {e}")
-
-def set_esp32_lowlight_params():
-    """Tested low-light params via ESP32 control endpoint. Values verified in browser."""
-    params = [
-        ("ae_level", 1),        # auto-exposure target +1
-        ("gainceiling", 3),     # gain ceiling 16x
-        ("led_intensity", 0),   # keep onboard LED off
-    ]
-    for var, val in params:
-        try:
-            url = f"{ESP32_CONTROL_BASE_URL}/control?var={var}&val={val}"
-            with urllib.request.urlopen(url, timeout=1.0) as response:
-                response.read()
-        except Exception as e:
-            print(f"[ESP32] param {var}={val} failed: {e}")
-    print("[ESP32] low-light params applied (ae_level=1, gainceiling=3, led=0)")
-
-def restore_esp32_camera_defaults():
-    """Restore ESP32-CAM presets. Only LED intensity (打光) is left out —
-    that is owned by set_esp32_lowlight_params()."""
-    params = [
-        ("framesize", 8),      # VGA
-        ("quality", 8),        # Arduino CAMERA_STREAM_JPEG_QUALITY
-        ("brightness", 0),
-        ("contrast", 0),
-        ("saturation", 0),
-        ("special_effect", 0),
-        ("wb_mode", 0),
-        ("awb", 1),
-        ("awb_gain", 1),
-        ("aec", 1),
-        ("aec2", 0),
-        ("ae_level", 0),
-        ("aec_value", 300),
-        ("agc", 1),
-        ("agc_gain", 0),
-        ("gainceiling", 0),
-        ("bpc", 0),
-        ("wpc", 1),
-        ("raw_gma", 1),
-        ("lenc", 1),
-        ("hmirror", 0),
-        ("vflip", 0),
-        ("dcw", 1),
-        ("colorbar", 0),
-    ]
-    for var, val in params:
-        try:
-            url = f"{ESP32_CONTROL_BASE_URL}/control?var={var}&val={val}"
-            with urllib.request.urlopen(url, timeout=1.0) as response:
-                response.read()
-        except Exception as e:
-            print(f"[ESP32] restore camera default {var}={val} failed: {e}")
-    print("[ESP32] camera defaults restored (lighting left to low-light params)")
-
-# ===== Mediapipe Face Detection =====
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(
-    model_selection=0,
-    min_detection_confidence=0.5,
-)
+# ===== (ESP32-CAM 摄像头与人脸检测已移除；视频识别由 hand_osc.py 的手追承担) =====
 
 DISPLAY_WIDTH = int(os.environ.get("DISPLAY_WIDTH", "800"))
 DISPLAY_HEIGHT = int(os.environ.get("DISPLAY_HEIGHT", "600"))
-VIDEO_ROTATE = os.environ.get("VIDEO_ROTATE", "cw").strip().lower()
-
-def orient_frame_for_display(frame):
-    """Rotate the camera image before detection and UI overlays are drawn."""
-    src_h, src_w = frame.shape[:2]
-    if VIDEO_ROTATE in ("none", "0", "false", "off"):
-        return frame
-    if VIDEO_ROTATE in ("cw", "clockwise", "90"):
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if VIDEO_ROTATE in ("ccw", "counterclockwise", "270", "-90"):
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    if VIDEO_ROTATE in ("180", "flip"):
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if VIDEO_ROTATE == "auto":
-        display_is_portrait = DISPLAY_HEIGHT > DISPLAY_WIDTH
-        frame_is_portrait = src_h > src_w
-        if display_is_portrait and not frame_is_portrait:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        if not display_is_portrait and frame_is_portrait:
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
-
-class LatestFrameReader:
-    def __init__(self, urls):
-        self.urls = urls if isinstance(urls, list) else [urls]
-        self.url_index = 0
-        self.url = self.urls[self.url_index]
-        self.cap = None
-        self.frame = None
-        self.frame_id = 0
-        self.running = True
-        self.last_frame_at = 0.0
-        self.lock = threading.Lock()
-        self.cap_lock = threading.Lock()
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-
-    def start(self):
-        print(f"ESP32 camera OpenCV thread → {self.url}")
-        self.thread.start()
-
-    def next_url(self):
-        if len(self.urls) <= 1:
-            return self.url
-        self.url_index = (self.url_index + 1) % len(self.urls)
-        self.url = self.urls[self.url_index]
-        print(f"[ESP32] trying alternate camera URL → {self.url}")
-        return self.url
-
-    def _open(self):
-        cap = cv2.VideoCapture(int(self.url)) if self.url.isdigit() else cv2.VideoCapture(self.url)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
-        return cap
-
-    def _loop(self):
-        last_fail_print = 0.0
-        while self.running:
-            with self.cap_lock:
-                needs_open = self.cap is None or not self.cap.isOpened()
-            if needs_open:
-                with self.cap_lock:
-                    if self.cap is not None:
-                        self.cap.release()
-                    self.cap = self._open()
-                    opened = self.cap.isOpened()
-                if not opened:
-                    if time.time() - last_fail_print >= 2.0:
-                        print(f"[ESP32] capture open failed: {self.url}")
-                        last_fail_print = time.time()
-                    self.next_url()
-                    time.sleep(0.5)
-                    continue
-
-            with self.cap_lock:
-                if self.cap is None:
-                    ret, frame = False, None
-                else:
-                    ret, frame = self.cap.read()
-            if not ret or frame is None:
-                if time.time() - last_fail_print >= 2.0:
-                    print("[ESP32] capture read failed; reconnecting in background")
-                    last_fail_print = time.time()
-                with self.cap_lock:
-                    if self.cap is not None:
-                        self.cap.release()
-                    self.cap = None
-                time.sleep(0.2)
-                continue
-
-            with self.lock:
-                self.frame = frame
-                self.frame_id += 1
-                self.last_frame_at = time.time()
-
-    def read(self):
-        with self.lock:
-            if self.frame is None:
-                return None, self.frame_id, self.last_frame_at
-            return self.frame, self.frame_id, self.last_frame_at
-
-    def reconnect(self):
-        with self.cap_lock:
-            if self.cap is not None:
-                self.cap.release()
-            self.cap = None
-
-    def stop(self):
-        self.running = False
-        with self.cap_lock:
-            if self.cap is not None:
-                self.cap.release()
-
-if SET_CAMERA_PROFILE_ON_STARTUP:
-    set_esp32_camera_profile(camera_profile_index, "startup")
-    restore_esp32_camera_defaults()
-
-if SET_LOWLIGHT_PARAMS_ON_STARTUP:
-    set_esp32_lowlight_params()
-
-camera = LatestFrameReader(ESP32_CAMERA_URLS)
-camera.start()
-esp32_frame_count = 0
-esp32_fps_count = 0
-last_esp32_fps_at = time.time()
-last_seen_frame_id = -1
-last_waiting_frame_print_at = 0.0
-last_stale_frame_print_at = 0.0
-last_face_detect_at = 0.0
-last_mp_result = None
-last_face_visible = False
 osc = SimpleUDPClient(OSC_IP, OSC_PORT)
 
 
@@ -1162,20 +904,41 @@ current_name = random.choice(NAME_POOL)
 current_personality = random.choice(PERSONALITY_PROFILES)
 current_story_thread = random.choice(STORY_THREADS)
 
-tof_presence = False  # Raw ToF/Arduino state: object is close enough to look at.
-servo_forced_self = False  # Python commanded Arduino back to SELF; raw ToF may lag.
-presence = False      # Final Python state: ToF object + MediaPipe face.
+tof_presence = False  # Raw ToF/Arduino state: object is close enough.
+presence = False      # Final Python state: ToF + hand-tracking signal.
 serial_connected = False
 serial_handle = None
 serial_lock = threading.Lock()
 
-# Presence is gated by both sensors: ToF first, then MediaPipe face check.
-ENABLE_GO_SELF_ON_TOF_WITHOUT_FACE = True
-GO_SELF_AFTER_NO_FACE_SECONDS = 3.0
-last_face_seen_at = time.time()
-go_self_sent_at = 0.0
+# ===== 手追信号桥 (hand_osc.py <-> 本进程, OSC) =====
+# hand_osc.py 把 /handon 转发到本进程 (HANDON_LISTEN_PORT)；
+# 本进程把 ToF 状态 /tofon 广播给 hand_osc.py (TOF_BROADCAST_PORT)，用于门控手追。
+HANDON_LISTEN_PORT = int(os.environ.get("HANDON_LISTEN_PORT", "10729"))
+TOF_BROADCAST_PORT = int(os.environ.get("TOF_BROADCAST_PORT", "10730"))
+HAND_SIGNAL_TIMEOUT = 2.0   # 超过此秒数没收到 /handon → 视为无手（hand_osc 未运行）
+hand_on = 0.0
+last_hand_msg_at = 0.0
+last_tof_broadcast_at = 0.0
 last_combined_presence = None
-tof_no_face_go_self_sent = False
+
+tof_osc = SimpleUDPClient("127.0.0.1", TOF_BROADCAST_PORT)
+
+def _on_handon_osc(addr, *args):
+    global hand_on, last_hand_msg_at
+    try:
+        hand_on = float(args[0]) if args else 0.0
+    except (TypeError, ValueError):
+        hand_on = 0.0
+    last_hand_msg_at = time.time()
+
+_handon_dispatcher = Dispatcher()
+_handon_dispatcher.map("/handon", _on_handon_osc)
+try:
+    _handon_server = ThreadingOSCUDPServer(("127.0.0.1", HANDON_LISTEN_PORT), _handon_dispatcher)
+    threading.Thread(target=_handon_server.serve_forever, daemon=True).start()
+    print(f"[OSC] listening for /handon on 127.0.0.1:{HANDON_LISTEN_PORT}")
+except OSError as e:
+    print(f"[OSC] /handon listener failed to bind :{HANDON_LISTEN_PORT}: {e}")
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "9600"))
 SERIAL_DISABLE = os.environ.get("SERIAL_DISABLE", "").strip().lower() in ("1", "true", "yes", "on")
@@ -1207,7 +970,7 @@ def serial_reader_loop():
       LOOK_SELF   -> tof_presence = False
       TOF_FAIL    -> log only
     """
-    global tof_presence, servo_forced_self, serial_connected, serial_handle, last_serial_scan_log_at
+    global tof_presence, serial_connected, serial_handle, last_serial_scan_log_at
     if SERIAL_DISABLE:
         serial_connected = False
         print("[SERIAL] disabled by SERIAL_DISABLE=1")
@@ -1238,15 +1001,21 @@ def serial_reader_loop():
                 if line == "LOOK_HUMAN":
                     if not is_reuniting_locked():
                         tof_presence = True
-                        servo_forced_self = False
-                        print(f"[SERIAL←] LOOK_HUMAN  (tof=True, forced_self=False)")
+                        print(f"[SERIAL←] LOOK_HUMAN  (tof=True)")
+                        try:
+                            tof_osc.send_message("/tofon", 1.0)
+                        except Exception:
+                            pass
                     else:
                         print(f"[SERIAL←] LOOK_HUMAN  IGNORED (REUNITING)")
                 elif line == "LOOK_SELF":
                     if not is_reuniting_locked():
                         tof_presence = False
-                        servo_forced_self = False
-                        print(f"[SERIAL←] LOOK_SELF  (tof=False, forced_self=False)")
+                        print(f"[SERIAL←] LOOK_SELF  (tof=False)")
+                        try:
+                            tof_osc.send_message("/tofon", 0.0)
+                        except Exception:
+                            pass
                     else:
                         print(f"[SERIAL←] LOOK_SELF  IGNORED (REUNITING)")
                 else:
@@ -1749,85 +1518,39 @@ try:
             whisper_tts.whisper_tts.enabled = not whisper_tts.whisper_tts.enabled
             print(f"[TTS] toggled -> {whisper_tts.whisper_tts.enabled}")
 
-        frame, frame_id, camera_last_frame_at = camera.read()
-        if frame is None:
-            if time.time() - last_waiting_frame_print_at >= 2.0:
-                print("[ESP32] waiting for camera frame")
-                last_waiting_frame_print_at = time.time()
-            continue
-        if frame_id == last_seen_frame_id:
-            if camera_last_frame_at and time.time() - camera_last_frame_at >= 3.0:
-                if time.time() - last_stale_frame_print_at >= 3.0:
-                    print("[ESP32] stream stalled; reconnecting")
-                    last_stale_frame_print_at = time.time()
-                camera.reconnect()
-                time.sleep(0.1)
-            time.sleep(0.005)
-            continue
-        last_seen_frame_id = frame_id
         now = time.time()
 
-        esp32_frame_count += 1
-        esp32_fps_count += 1
-        if esp32_frame_count == 1:
-            print(f"[ESP32] first frame decoded: {frame.shape[1]}x{frame.shape[0]} → display {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
-        elif time.time() - last_esp32_fps_at >= 5.0:
-            elapsed = time.time() - last_esp32_fps_at
-            fps = esp32_fps_count / elapsed
-            # print(f"[ESP32] receiving video: {fps:.1f} fps")
-            if AUTO_CAMERA_QUALITY:
-                if fps < 10.0 and camera_profile_index > 0:
-                    set_esp32_camera_profile(camera_profile_index - 1, f"low fps {fps:.1f}")
-                elif fps > 20.0 and camera_profile_index < len(CAMERA_PROFILES) - 1:
-                    camera_good_fps_streak += 1
-                    if camera_good_fps_streak >= 2:
-                        set_esp32_camera_profile(camera_profile_index + 1, f"stable fps {fps:.1f}")
-                else:
-                    camera_good_fps_streak = 0
-            esp32_fps_count = 0
-            last_esp32_fps_at = time.time()
-    
-        frame = cv2.flip(frame, 1)
-        frame = orient_frame_for_display(frame)
-
-        # --- Eye detection via mediapipe ---
-        # Run detection at a capped rate; reusing the last result keeps video responsive.
-        if now - last_face_detect_at >= FACE_DETECT_INTERVAL:
-            _bright = cv2.LUT(frame, _DETECT_GAMMA_LUT)
-            rgb = cv2.cvtColor(_bright, cv2.COLOR_BGR2RGB)
-            last_mp_result = face_detection.process(rgb)
-            last_face_detect_at = now
-            last_face_visible = bool(last_mp_result.detections)
-        mp_result = last_mp_result
-        src_h, src_w = frame.shape[:2]
-        _scale = min(DISPLAY_WIDTH / src_w, DISPLAY_HEIGHT / src_h)
-        _new_w = max(1, int(round(src_w * _scale)))
-        _new_h = max(1, int(round(src_h * _scale)))
-        resize_interp = cv2.INTER_CUBIC if _scale > 1.0 else cv2.INTER_AREA
-        _resized = cv2.resize(frame, (_new_w, _new_h), interpolation=resize_interp)
+        # --- 白底画布（摄像头已移除，仅渲染 UI）---
         frame = np.full((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), 255, dtype=np.uint8)
-        _off_x = (DISPLAY_WIDTH - _new_w) // 2
-        _off_y = (DISPLAY_HEIGHT - _new_h) // 2
-        frame[_off_y:_off_y + _new_h, _off_x:_off_x + _new_w] = _resized
-        face_visible_this_frame = last_face_visible
-        stage1_active = bool(tof_presence and not servo_forced_self)
-        if face_visible_this_frame:
-            last_face_seen_at = time.time()
-            tof_no_face_go_self_sent = False
-        elif not stage1_active:
-            tof_no_face_go_self_sent = False
+        _off_x, _off_y = 0, 0
+        _new_w, _new_h = DISPLAY_WIDTH, DISPLAY_HEIGHT
+
+        # --- presence: ToF + 手追信号 ---
+        hand_seen = (
+            hand_on >= 0.5
+            and (now - last_hand_msg_at) <= HAND_SIGNAL_TIMEOUT
+        )
+        stage1_active = bool(tof_presence)
+
+        # 定时向 hand_osc.py 广播 ToF 状态（门控手追；也让后启动的 hand_osc 同步）
+        if now - last_tof_broadcast_at >= 0.5:
+            try:
+                tof_osc.send_message("/tofon", 1.0 if tof_presence else 0.0)
+            except Exception:
+                pass
+            last_tof_broadcast_at = now
 
         if state == "REUNITING":
             combined_presence = presence
         else:
-            combined_presence = bool(stage1_active and face_visible_this_frame)
+            combined_presence = bool(stage1_active and hand_seen)
 
         if combined_presence != presence:
             presence = combined_presence
             if last_combined_presence is not None:
-                reason = f"tof_raw={tof_presence} forced_self={servo_forced_self} stage1_active={stage1_active} face={face_visible_this_frame}"
-                label = "LOOK_HUMAN" if presence else "LOOK_SELF"
-                print(f"[PRESENCE] {reason} → {label} (combined)")
+                reason = f"tof={tof_presence} hand={hand_seen}"
+                label = "PRESENT" if presence else "ABSENT"
+                print(f"[PRESENCE] {reason} → {label}")
             last_combined_presence = presence
 
         # --- 状態機 ---
@@ -1958,32 +1681,10 @@ try:
             cv2.circle(img, (x2 - radius, y1 + radius), radius, color, -1)
             cv2.circle(img, (x1 + radius, y2 - radius), radius, color, -1)
             cv2.circle(img, (x2 - radius, y2 - radius), radius, color, -1)
-        # Draw face detection box + animated "WATCHING..." label.
-        if mp_result and mp_result.detections:
-            h, w = annotated.shape[:2]
-            EYE_BOX_COLOR_BGR = WHITE_BGR
-            EYE_BOX_PADDING = 6  # 像素，给框留点呼吸空间
-
-            for detection in mp_result.detections:
-                bbox = detection.location_data.relative_bounding_box
-                x_min = max(0, int(bbox.xmin * w) - EYE_BOX_PADDING)
-                y_min = max(0, int(bbox.ymin * h) - EYE_BOX_PADDING)
-                x_max = min(w - 1, int((bbox.xmin + bbox.width) * w) + EYE_BOX_PADDING)
-                y_max = min(h - 1, int((bbox.ymin + bbox.height) * h) + EYE_BOX_PADDING)
-    
-                # 画主框（紫色，睁眼时显示）
-                cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), EYE_BOX_COLOR_BGR, 2)
-    
-                # === 动态 WATCHING... 标签 ===
-                # 三个点循环：每秒加一个，3 秒后回到 0 个，再循环
-                dots_count = int(time.time()) % 4   # 0, 1, 2, 3, 0, 1, 2, 3...
-                watching_text = "WATCHING" + "." * dots_count
-                cv2.putText(annotated, watching_text, (x_min, max(y_min - 8, 18)),
-                            UI_FONT, 0.7 * FONT_SCALE_MULT, WHITE_BGR, 2)
         info = [
             f"name: {current_name}   cycle #{cycle_count}",
-            f"stage1: {stage1_active}",
-            f"stage2: {face_visible_this_frame}",
+            f"tof: {stage1_active}",
+            f"hand: {hand_seen}",
             f"emotion: {current_stage_from_drift('SELF')}",
             f"personality: {current_personality['name']}",
         ]
@@ -2162,23 +1863,10 @@ try:
             if _ei < len(llm_text_history) - 1:
                 _cy += _blh
     
-        # ToF can turn toward an object first; if no face is confirmed, return after a short look.
-        if (
-            ENABLE_GO_SELF_ON_TOF_WITHOUT_FACE
-            and state != "REUNITING"
-            and stage1_active
-            and not face_visible_this_frame
-            and not tof_no_face_go_self_sent
-            and (time.time() - last_face_seen_at) >= GO_SELF_AFTER_NO_FACE_SECONDS
-        ):
-            if time.time() - go_self_sent_at > 1.0:
-                send_serial_command("GO_SELF_HOLD\n")
-                servo_forced_self = True
-                go_self_sent_at = time.time()
-                tof_no_face_go_self_sent = True
-                print(f"[SERIAL→] GO_SELF_HOLD (tof=True, forced_self=True, no face for {time.time() - last_face_seen_at:.1f}s)")
     
         cv2.imshow('YOLO-World + State', annotated)
+
+        time.sleep(0.03)  # 手动限速 ~30fps（原先由摄像头帧率驱动）
 
         key = cv2.waitKey(1) & 0xFF
         window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
@@ -2190,5 +1878,4 @@ except KeyboardInterrupt:
 finally:
     whisper_tts.whisper_tts.stop()
     lyric_page.lyric_page.stop()
-    camera.stop()
     cv2.destroyAllWindows()

@@ -9,7 +9,7 @@ import whisper_tts
 import lyric_page
 from pythonosc.udp_client import SimpleUDPClient
 
-# —— 节奏常量（复刻自 esp32.py）——
+# —— 节奏常量（复刻自 narcissus_main.py）——
 LLM_TRIGGER_INTERVAL     = 4.0
 READ_PACE_CHARS_PER_SEC  = 16.0
 READ_MIN_SECONDS         = 3.0
@@ -20,7 +20,7 @@ OSC_IP = "127.0.0.1"
 OSC_PORT = 10727
 DISSOLVE_SEND_FPS = 30      # dissolve 平滑发送帧率
 DISSOLVE_SMOOTH = 0.03      # 每帧向目标逼近的比例(0~1，越小越慢越顺)。
-                            # 放慢是刻意的：主程序 esp32.py 里 flower_val 变化极慢
+                            # 放慢是刻意的：主程序 narcissus_main.py 里 flower_val 变化极慢
                             # (40 秒溶解 / 20 秒回凝)，所以观感是缓慢漂移、几乎不到两端。
 # 全局钳制：无论目标怎么给，dissolve 都锁在中间带，保证“不完全溶解也不完全凝聚”
 DISSOLVE_MIN = 0.22
@@ -40,7 +40,7 @@ STAGE_DISSOLVE = {
 }
 DISSOLVE_DEFAULT = 0.40
 
-# —— 预设文字库（内联复制自 esp32.py 第 1460-1506 行的 LOCAL_LLM_FALLBACKS）——
+# —— 预设文字库（内联复制自 narcissus_main.py 第 1460-1506 行的 LOCAL_LLM_FALLBACKS）——
 LOCAL_LLM_FALLBACKS = {
     "shock": [
         "wait— the lines moved with me.",

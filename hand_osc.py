@@ -32,11 +32,14 @@ stants (top of file):
 """
 
 import sys
+import threading
 import time
 
 import cv2
 import mediapipe as mp
 from pythonosc.udp_client import SimpleUDPClient
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import ThreadingOSCUDPServer
 
 # ======================= 可调常量（现场校准就改这里）=======================
 CAMERA_INDEX = 0
@@ -58,6 +61,13 @@ FPS = 30
 LYRIC_OSC_IP = "127.0.0.1"
 LYRIC_OSC_PORT = 10728
 LYRIC_OSC_ENABLE = True  # also mirror /handon to the lyric page; flip off on-site if needed
+
+# ===== ToF 门控 / narcissus_main.py 联动 =====
+ESP_FORWARD_ENABLE = True
+ESP_OSC_IP = "127.0.0.1"
+ESP_OSC_PORT = 10729      # narcissus_main.py 在此端口接收 /handon（参与 presence 判定）
+TOF_LISTEN_PORT = 10730   # narcissus_main.py 在此端口广播 /tofon（ToF 有人=1 / 没人=0）
+TOF_GATE_TIMEOUT = 5.0    # 超过此秒数没收到 /tofon → 认为 narcissus_main.py 未运行，门保持打开
 
 SHOW_WINDOW = False
 # ==========================================================================
@@ -86,6 +96,27 @@ def main():
     osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
     lyric_client = SimpleUDPClient(LYRIC_OSC_IP, LYRIC_OSC_PORT) if LYRIC_OSC_ENABLE else None
     lyric_warned = False
+
+    # ToF 门控状态：narcissus_main.py 广播 /tofon；收不到时默认打开（可独立运行）
+    tof_state = {"on": True, "at": 0.0}
+
+    def _on_tofon(addr, *args):
+        try:
+            v = float(args[0]) if args else 1.0
+        except (TypeError, ValueError):
+            v = 1.0
+        tof_state["on"] = v >= 0.5
+        tof_state["at"] = time.time()
+
+    _tof_dispatcher = Dispatcher()
+    _tof_dispatcher.map("/tofon", _on_tofon)
+    try:
+        _tof_server = ThreadingOSCUDPServer(("127.0.0.1", TOF_LISTEN_PORT), _tof_dispatcher)
+        threading.Thread(target=_tof_server.serve_forever, daemon=True).start()
+        print(f"[hand_osc] listening for /tofon on 127.0.0.1:{TOF_LISTEN_PORT}")
+    except OSError as e:
+        print(f"[hand_osc] tof listener failed to bind :{TOF_LISTEN_PORT} ({e}); gate stays open")
+    esp_client = SimpleUDPClient(ESP_OSC_IP, ESP_OSC_PORT) if ESP_FORWARD_ENABLE else None
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -156,10 +187,20 @@ def main():
                     hand_off_streak += 1
                     hand_on = 0.0 if hand_off_streak >= HAND_OFF_FRAMES else 1.0
 
-                if smoothed_x is not None:
+                # ToF 门控：narcissus_main.py 判"没人"时强制 handon=0，坐标也不发。
+                # 收不到 /tofon（narcissus_main.py 未运行）超过 TOF_GATE_TIMEOUT → 门保持打开，独立运行。
+                tof_gate_open = tof_state["on"] or (time.time() - tof_state["at"]) > TOF_GATE_TIMEOUT
+                if not tof_gate_open:
+                    hand_on = 0.0
+                if tof_gate_open and smoothed_x is not None:
                     osc_client.send_message("/handx", float(smoothed_x))
                     osc_client.send_message("/handy", float(smoothed_y))
                 osc_client.send_message("/handon", float(hand_on))
+                if esp_client is not None:
+                    try:
+                        esp_client.send_message("/handon", float(hand_on))
+                    except Exception:
+                        pass
                 if lyric_client is not None:
                     try:
                         lyric_client.send_message("/handon", float(hand_on))
