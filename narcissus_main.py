@@ -39,9 +39,12 @@ OSC_PORT = 10727
 # ===== 消散/重组参数 =====
 REUNITING_SILENT_SECONDS = 3.0
 # DISSOLVE_RATE: flower_val 每秒下降量。1/40 = 40 秒走完全程。
-# REASSEMBLE_RATE: flower_val 每秒上升量。1/20 = 20 秒走完全程。
+# REASSEMBLE_RATE: flower_val 每秒上升量。1/40 = 40 秒走完全程。
 DISSOLVE_RATE = 1.0 / 40.0
-REASSEMBLE_RATE = 1.0 / 20.0
+REASSEMBLE_RATE = 1.0 / 40.0
+DISSOLVE_OUT_MIN = 0.12    # 发给 TD 的 dissolve 下限；花最凝聚时也不完全实心
+DISSOLVE_OUT_MAX = 0.80    # 上限；保证 TD 侧 attract gain 不归零，粒子飞不出画面
+DISSOLVE_EASE = True       # 是否对 flower_val 施加 smoothstep 缓动
 # 旧常量保留定义但已弃用
 DISSOLVE_SECONDS = 40.0       # deprecated
 REASSEMBLE_SECONDS = 20.0     # deprecated
@@ -53,8 +56,10 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 LLM_OFFLINE_FALLBACK = os.environ.get("LLM_OFFLINE_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
 LLM_MEMORY_WINDOW = 10
 LLM_TRIGGER_INTERVAL = 4.0
-LLM_MAX_TOKENS = 150
+LLM_MAX_TOKENS = 70
 LLM_ERROR_BACKOFF_SECONDS = float(os.environ.get("LLM_ERROR_BACKOFF_SECONDS", "60"))
+# 独白硬性长度兜底：超过此字符数则截断（7 寸屏一句不超过 2-3 行）。
+MONOLOGUE_MAX_CHARS = 110
 
 # Reading pace — extends trigger interval based on output length so long
 # thoughts stay on screen long enough to be read.
@@ -248,15 +253,15 @@ DISSOLVING:
 - Do not announce that you are dissolving. let it happen in the quality of the thought.
 
 RHYTHM:
-- mix short fragments with longer thoughts. let length come from the moment.
+- keep every output under 90 characters. short fragments are the norm; a medium line is the maximum.
 - short fragments are allowed: "oh." "hm." "wait." "yeah." "no." "..."
-- longer thoughts are allowed when the idea needs breath.
 - let short and long lines alternate naturally. do not force every output into the same size.
 - the rhythm should feel like real thinking — pauses, fragments, restarts. not paragraphs. not neat.
 - avoid: three medium-length sentences in a row, all roughly the same length. that's the failure mode.
 - vary your shape: sometimes a question, sometimes a correction, sometimes an embarrassed aside, sometimes a tiny observation.
 - statements should be more common than questions. do not turn every thought into a question.
 - avoid the easy endings: "that's something", "that's weird", "okay", unless they truly fit. Do not lean on them.
+- never output more than one sentence plus a fragment. if a thought needs more room, cut it short instead.
 
 PUNCTUATION:
 - punctuation should match the feeling of the line, not the grammar.
@@ -692,6 +697,7 @@ REASSEMBLE_POOL_PHASE_3 = [
 
 DISPLAY_WIDTH = int(os.environ.get("DISPLAY_WIDTH", "800"))
 DISPLAY_HEIGHT = int(os.environ.get("DISPLAY_HEIGHT", "600"))
+SHOW_HUD = os.environ.get("SHOW_HUD", "0") == "1"   # 调试用；装置运行时保持关闭
 osc = SimpleUDPClient(OSC_IP, OSC_PORT)
 
 
@@ -702,7 +708,7 @@ reuniting_silent_until = 0.0          # timestamp when silent phase ends
 state_entered_at = time.time()
 last_frame_at = state_entered_at
 flower_val = 1.0
-dissolve_amount = 0.0
+dissolve_amount = DISSOLVE_OUT_MIN
 last_uniting_serial_sent = 0.0
 uniting_serial_active = False
 
@@ -853,12 +859,11 @@ PERSONALITY_PROFILES = [
         "prompt": (
             "- Tone: catlike, self-possessed, curious, a little aloof.\n"
             "- You decide closeness on your own terms. You may pretend not to need the person while clearly staying near.\n"
-            "- Every output MUST use this exact structure: meowmeowmeowmeow (human-language thought).\n"
-            "- The part outside parentheses is only meow repeated 2-6 times, with no spaces between meows.\n"
             "- The actual thought goes inside parentheses in lowercase English.\n"
-            "- Use catlike attitudes: hm, no, closer is acceptable, i was already doing that."
+            "- Use catlike attitudes: hm, no, closer is acceptable, i was already doing that.\n"
+            "- Write a plain short thought in lowercase English. Do not write any meow sounds — they are added afterwards."
         ),
-        "meta": "- Meta style: readings are rude little labels placed on you. Example: meowmeowmeow (coherence rose. i allowed that, apparently.)",
+        "meta": "- Meta style: readings are rude little labels placed on you. Example: coherence rose. i allowed that, apparently.",
     },
     {
         "name": "shakespearean",
@@ -915,10 +920,14 @@ serial_lock = threading.Lock()
 # 本进程把 ToF 状态 /tofon 广播给 hand_osc.py (TOF_BROADCAST_PORT)，用于门控手追。
 HANDON_LISTEN_PORT = int(os.environ.get("HANDON_LISTEN_PORT", "10729"))
 TOF_BROADCAST_PORT = int(os.environ.get("TOF_BROADCAST_PORT", "10730"))
+TOF_ENABLE = os.environ.get("TOF_ENABLE", "0") == "1"   # 0 = 不接 Arduino/ToF，presence 只由手追决定
+HAND_DRIVES_FLOWER = os.environ.get("HAND_DRIVES_FLOWER", "0") == "1"
+# 0 = 手只影响 LLM 语气，花自主循环；1 = 旧行为，手把花拉满凝聚
 HAND_SIGNAL_TIMEOUT = 2.0   # 超过此秒数没收到 /handon → 视为无手（hand_osc 未运行）
 hand_on = 0.0
 last_hand_msg_at = 0.0
 last_tof_broadcast_at = 0.0
+last_presence_edge = None
 last_combined_presence = None
 
 tof_osc = SimpleUDPClient("127.0.0.1", TOF_BROADCAST_PORT)
@@ -1037,8 +1046,11 @@ def send_serial_command(cmd: str):
             except Exception as e:
                 print(f"[SERIAL] write failed: {e}")
 
-serial_thread = threading.Thread(target=serial_reader_loop, daemon=True)
-serial_thread.start()
+if TOF_ENABLE:
+    serial_thread = threading.Thread(target=serial_reader_loop, daemon=True)
+    serial_thread.start()
+else:
+    print("[TOF] disabled — presence driven by hand tracking only")
 
 # LLM state
 llm_conversation = deque(maxlen=LLM_MEMORY_WINDOW * 2)
@@ -1321,15 +1333,79 @@ def normalize_llm_thought(thought):
         i += 1
     thought = "".join(chars)
     thought = re.sub(r"\s+", " ", thought)
+    if len(thought) > MONOLOGUE_MAX_CHARS:
+        original_len = len(thought)
+        window = thought[:MONOLOGUE_MAX_CHARS]
+        cut = max(window.rfind(c) for c in ".?!-")
+        if cut != -1:
+            truncated = window[:cut + 1]
+        else:
+            cut = window.rfind(" ")
+            truncated = (window[:cut] if cut != -1 else window) + "-"
+        thought = truncated
+        print(f"[LLM] truncated {original_len}->{len(thought)} chars")
     return thought
 
 
-def format_cat_thought(thought):
-    inner = re.sub(r"^\s*((?:meow){1,12}|mew|mrr|nya|prr)[\s.:-]*", "", thought, flags=re.IGNORECASE).strip()
-    if inner.startswith("(") and inner.endswith(")"):
-        inner = inner[1:-1].strip()
-    inner = inner or "the mirror moved. i noticed first."
-    return f"meowmeowmeowmeow ({inner})"
+_CAT_MEOW_COLLAPSING = [
+    "meow. me- meow?",
+    "mrr. meow meow-",
+    "meow- meow. m-",
+    "me- meow. meow-",
+    "mrr- meow. m-",
+]
+_CAT_MEOW_SHOCK = [
+    "meow!",
+    "mew!",
+    "meow! mrr!",
+    "mrr!",
+    "meow! meow!",
+]
+_CAT_MEOW_QUESTIONING = [
+    "meow? meow meow?",
+    "mrr? meow?",
+    "meow? mrr?",
+    "meow meow?",
+    "mrr meow?",
+]
+_CAT_MEOW_CALM = [
+    "meeeow. meow.",
+    "mrrrow. meow meow.",
+    "meow. meeeow.",
+    "meeeow. mrrrow.",
+    "meow meow. meeeow.",
+]
+_CAT_MEOW_SMALL_TALK = [
+    "meow meow. mrr.",
+    "meow. meow.",
+    "mrr. mrr meow.",
+    "meow. mrr.",
+    "mrr meow. meow.",
+]
+
+CAT_MEOW_PATTERNS = {
+    "collapsing": _CAT_MEOW_COLLAPSING,
+    "unraveling": _CAT_MEOW_COLLAPSING,
+    "shock": _CAT_MEOW_SHOCK,
+    "questioning": _CAT_MEOW_QUESTIONING,
+    "calm": _CAT_MEOW_CALM,
+    "soothed": _CAT_MEOW_CALM,
+    "acknowledged": _CAT_MEOW_CALM,
+    "small_talk": _CAT_MEOW_SMALL_TALK,
+    "self_murmur": _CAT_MEOW_SMALL_TALK,
+}
+
+_last_cat_meow = None
+
+
+def format_cat_thought(thought, stage):
+    global _last_cat_meow
+    candidates = CAT_MEOW_PATTERNS.get(stage, CAT_MEOW_PATTERNS["self_murmur"])
+    choice = random.choice(candidates)
+    if choice == _last_cat_meow and len(candidates) > 1:
+        choice = random.choice(candidates)
+    _last_cat_meow = choice
+    return choice
 
 
 def remember_cycle_thought(signal_type, current_state, stage, thought):
@@ -1420,19 +1496,22 @@ def query_llm(signal_type, confidence, current_state, name):
         thought = local_llm_fallback(perception, signal_type)
 
     thought = normalize_llm_thought(thought)
-    if current_personality["name"] == "cat":
-        thought = format_cat_thought(thought)
+    raw_thought = thought
 
     llm_conversation.append({"role": "user", "content": continuity_prompt})
-    llm_conversation.append({"role": "assistant", "content": thought})
+    llm_conversation.append({"role": "assistant", "content": raw_thought})
 
     # Update drift vector with embedding of this output
-    new_emb = embedder.encode(thought, convert_to_numpy=True)
+    new_emb = embedder.encode(raw_thought, convert_to_numpy=True)
     drift_vector = drift_vector * DRIFT_DECAY + new_emb * DRIFT_WEIGHT
 
     # Compute cosine similarities for all anchors for debug display
     active_stage = current_stage_from_drift(signal_type)
-    remember_cycle_thought(signal_type, current_state, active_stage, thought)
+
+    if current_personality["name"] == "cat":
+        thought = format_cat_thought(raw_thought, active_stage)
+
+    remember_cycle_thought(signal_type, current_state, active_stage, raw_thought)
     whisper_tts.whisper_tts.speak(thought, active_stage, signal_type, flower_val)
     lyric_page.lyric_page.push(thought)
     label = f"{active_stage} | coh:{flower_val:.2f}"
@@ -1501,39 +1580,54 @@ def print_reassemble_thought(progress):
     lyric_page.lyric_page.push(thought, is_reassemble=True)
 
 
+def flower_to_dissolve(v):
+    """把内部 flower_val (0..1) 映射为发送给 TD 的 dissolve 值。
+    v=1 (完全凝聚) → DISSOLVE_OUT_MIN；v=0 (完全溶解) → DISSOLVE_OUT_MAX。"""
+    v = min(1.0, max(0.0, v))
+    if DISSOLVE_EASE:
+        v = v * v * (3 - 2 * v)
+    out = DISSOLVE_OUT_MAX + (DISSOLVE_OUT_MIN - DISSOLVE_OUT_MAX) * v
+    return min(DISSOLVE_OUT_MAX, max(DISSOLVE_OUT_MIN, out))
+
+
 # ===== 主循环 =====
 whisper_tts.whisper_tts.start()
 lyric_page.lyric_page.start()
 print(f"[TTS] whisper module: {'ON' if whisper_tts.TTS_ENABLE else 'OFF'}")
 
-cv2.namedWindow('YOLO-World + State', cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty('YOLO-World + State', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+if SHOW_HUD:
+    cv2.namedWindow('YOLO-World + State', cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty('YOLO-World + State', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 try:
     while True:
-        key = cv2.waitKey(1) & 0xFF
-        window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
-        if key in (ord('q'), 27) or not window_open:
-            break
-        if key == ord('t'):
-            whisper_tts.whisper_tts.enabled = not whisper_tts.whisper_tts.enabled
-            print(f"[TTS] toggled -> {whisper_tts.whisper_tts.enabled}")
+        if SHOW_HUD:
+            key = cv2.waitKey(1) & 0xFF
+            window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
+            if key in (ord('q'), 27) or not window_open:
+                break
+            if key == ord('t'):
+                whisper_tts.whisper_tts.enabled = not whisper_tts.whisper_tts.enabled
+                print(f"[TTS] toggled -> {whisper_tts.whisper_tts.enabled}")
+        else:
+            time.sleep(0.01)
 
         now = time.time()
 
         # --- 白底画布（摄像头已移除，仅渲染 UI）---
-        frame = np.full((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), 255, dtype=np.uint8)
-        _off_x, _off_y = 0, 0
-        _new_w, _new_h = DISPLAY_WIDTH, DISPLAY_HEIGHT
+        if SHOW_HUD:
+            frame = np.full((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), 255, dtype=np.uint8)
+            _off_x, _off_y = 0, 0
+            _new_w, _new_h = DISPLAY_WIDTH, DISPLAY_HEIGHT
 
         # --- presence: ToF + 手追信号 ---
         hand_seen = (
             hand_on >= 0.5
             and (now - last_hand_msg_at) <= HAND_SIGNAL_TIMEOUT
         )
-        stage1_active = bool(tof_presence)
+        stage1_active = bool(tof_presence) if TOF_ENABLE else True
 
         # 定时向 hand_osc.py 广播 ToF 状态（门控手追；也让后启动的 hand_osc 同步）
-        if now - last_tof_broadcast_at >= 0.5:
+        if TOF_ENABLE and now - last_tof_broadcast_at >= 0.5:
             try:
                 tof_osc.send_message("/tofon", 1.0 if tof_presence else 0.0)
             except Exception:
@@ -1548,10 +1642,22 @@ try:
         if combined_presence != presence:
             presence = combined_presence
             if last_combined_presence is not None:
-                reason = f"tof={tof_presence} hand={hand_seen}"
+                reason = f"tof={tof_presence} hand={hand_seen}" if TOF_ENABLE else f"hand={hand_seen}"
                 label = "PRESENT" if presence else "ABSENT"
                 print(f"[PRESENCE] {reason} → {label}")
             last_combined_presence = presence
+
+        if not HAND_DRIVES_FLOWER:
+            if last_presence_edge is not None and presence != last_presence_edge:
+                if not presence:
+                    pending_shock = True
+                    drift_vector = drift_vector * 0.3
+                    remember_cycle_event("the person left or stopped registering; the mirror takes over again.")
+                    print(f"[SIGNAL] hand gone → SELF (SHOCK queued)")
+                else:
+                    remember_cycle_event("outside evidence returned; a person is close enough to interrupt the mirror.")
+                    print(f"[SIGNAL] hand present → OTHER")
+            last_presence_edge = presence
 
         # --- 状態機 ---
         dt = now - last_frame_at
@@ -1570,13 +1676,21 @@ try:
     
         if state == "WAITING":
             # First frame: pick initial state based on presence
-            state = "ASSEMBLING" if presence else "DISSOLVING"
-            state_entered_at = now
-            if state == "DISSOLVING":
-                # treat boot-into-DISSOLVING as a shock trigger
-                pending_shock = True
-                drift_vector = drift_vector * 0.3
-                llm_text_history.clear()
+            if HAND_DRIVES_FLOWER:
+                state = "ASSEMBLING" if presence else "DISSOLVING"
+                state_entered_at = now
+                if state == "DISSOLVING":
+                    # treat boot-into-DISSOLVING as a shock trigger
+                    pending_shock = True
+                    drift_vector = drift_vector * 0.3
+                    llm_text_history.clear()
+            else:
+                state = "DISSOLVING"
+                state_entered_at = now
+                pending_shock = not presence
+                if pending_shock:
+                    drift_vector = drift_vector * 0.3
+                    llm_text_history.clear()
     
         elif state == "ASSEMBLING":
             flower_val = min(1.0, flower_val + REASSEMBLE_RATE * dt)
@@ -1590,7 +1704,7 @@ try:
     
         elif state == "DISSOLVING":
             flower_val = max(0.0, flower_val - DISSOLVE_RATE * dt)
-            if presence:
+            if HAND_DRIVES_FLOWER and presence:
                 state = "ASSEMBLING"
                 state_entered_at = now
                 remember_cycle_event("outside evidence returned; a person is close enough to interrupt the mirror.")
@@ -1606,7 +1720,7 @@ try:
     
         elif state == "REUNITING":
             if reuniting_phase == "silent":
-                # flower_val stays at 0, NO OSC sent, NO LLM
+                # flower_val stays at 0, NO LLM (dissolve/dissolve_amount still sent, fixed at DISSOLVE_OUT_MAX)
                 if now >= reuniting_silent_until:
                     reuniting_phase = "rebuild"
                     print(f"\n[{time.strftime('%H:%M:%S')}] → REUNITING rebuild phase")
@@ -1626,16 +1740,22 @@ try:
                     drift_vector = np.zeros(384)
                     print_cycle_header()
     
-                    if presence:
-                        state = "ASSEMBLING"
-                        print(f"[{time.strftime('%H:%M:%S')}] cycle start → ASSEMBLING (presence=True)")
+                    if HAND_DRIVES_FLOWER:
+                        if presence:
+                            state = "ASSEMBLING"
+                            print(f"[{time.strftime('%H:%M:%S')}] cycle start → ASSEMBLING (presence=True)")
+                        else:
+                            state = "DISSOLVING"
+                            pending_shock = True
+                            # drift_vector already zeroed above, no ×0.3 needed
+                            print(f"[{time.strftime('%H:%M:%S')}] cycle start → DISSOLVING (presence=False, SHOCK queued)")
                     else:
                         state = "DISSOLVING"
-                        pending_shock = True
+                        pending_shock = not presence
                         # drift_vector already zeroed above, no ×0.3 needed
-                        print(f"[{time.strftime('%H:%M:%S')}] cycle start → DISSOLVING (presence=False, SHOCK queued)")
+                        print(f"[{time.strftime('%H:%M:%S')}] cycle start → DISSOLVING (flower autonomous)")
     
-        dissolve_amount = 1.0 - flower_val
+        dissolve_amount = flower_to_dissolve(flower_val)
     
         # Tell Arduino to detach/reattach the servo around the whole uniting phase.
         if state == "REUNITING":
@@ -1648,16 +1768,22 @@ try:
             uniting_serial_active = False
             last_uniting_serial_sent = now
     
-        # === OSC (skip entirely during REUNITING silent phase) ===
-        if not (state == "REUNITING" and reuniting_phase == "silent"):
-            osc.send_message("/dissolve", dissolve_amount)
-            osc.send_message("/dissolve_amount", dissolve_amount)
+        # === OSC (silent 阶段仍发 /dissolve 与 /dissolve_amount，固定为 DISSOLVE_OUT_MAX，
+        #     避免 TD 侧 attract gain 在这几秒内归零、粒子无约束逃逸；/confidence 保持跳过) ===
+        is_reuniting_silent = state == "REUNITING" and reuniting_phase == "silent"
+        dissolve_out = DISSOLVE_OUT_MAX if is_reuniting_silent else dissolve_amount
+        osc.send_message("/dissolve", dissolve_out)
+        osc.send_message("/dissolve_amount", dissolve_out)
+        if not is_reuniting_silent:
             osc.send_message("/confidence", 0.0)
     
         # === LLM trigger ===
         if state in ("ASSEMBLING", "DISSOLVING"):
             if now - last_llm_trigger >= LLM_TRIGGER_INTERVAL and now >= next_allowed_trigger:
-                signal = "OTHER" if state == "ASSEMBLING" else "SELF"
+                if HAND_DRIVES_FLOWER:
+                    signal = "OTHER" if state == "ASSEMBLING" else "SELF"
+                else:
+                    signal = "OTHER" if presence else "SELF"
                 trigger_llm_async(signal, 0.0, state, current_name)
                 last_llm_trigger = now
     
@@ -1666,216 +1792,219 @@ try:
             print_reassemble_thought(flower_val)
             last_reassemble_print = now
     
-        # --- 可視化 ---
-        annotated = frame.copy()
-        WHITE_BGR = (255, 255, 255)
-        BLACK_BGR = (0, 0, 0)
-        UI_FONT = cv2.FONT_HERSHEY_DUPLEX
-        FONT_SCALE_MULT = 1.5
+        if SHOW_HUD:
+            # --- 可視化 ---
+            annotated = frame.copy()
+            WHITE_BGR = (255, 255, 255)
+            BLACK_BGR = (0, 0, 0)
+            UI_FONT = cv2.FONT_HERSHEY_DUPLEX
+            FONT_SCALE_MULT = 1.5
     
-        def _rounded_rect(img, x1, y1, x2, y2, radius, color):
-            radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
-            cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
-            cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
-            cv2.circle(img, (x1 + radius, y1 + radius), radius, color, -1)
-            cv2.circle(img, (x2 - radius, y1 + radius), radius, color, -1)
-            cv2.circle(img, (x1 + radius, y2 - radius), radius, color, -1)
-            cv2.circle(img, (x2 - radius, y2 - radius), radius, color, -1)
-        info = [
-            f"name: {current_name}   cycle #{cycle_count}",
-            f"tof: {stage1_active}",
-            f"hand: {hand_seen}",
-            f"emotion: {current_stage_from_drift('SELF')}",
-            f"personality: {current_personality['name']}",
-        ]
+            def _rounded_rect(img, x1, y1, x2, y2, radius, color):
+                radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+                cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
+                cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+                cv2.circle(img, (x1 + radius, y1 + radius), radius, color, -1)
+                cv2.circle(img, (x2 - radius, y1 + radius), radius, color, -1)
+                cv2.circle(img, (x1 + radius, y2 - radius), radius, color, -1)
+                cv2.circle(img, (x2 - radius, y2 - radius), radius, color, -1)
+            info = [
+                f"name: {current_name}   cycle #{cycle_count}",
+                f"tof: {stage1_active}",
+                f"hand: {hand_seen}",
+                f"emotion: {current_stage_from_drift('SELF')}",
+                f"personality: {current_personality['name']}",
+            ]
     
-        # --- Emotion vector overlay (top-right, two-column) ---
-        EMOTION_COLOR_BGR = WHITE_BGR
+            # --- Emotion vector overlay (top-right, two-column) ---
+            EMOTION_COLOR_BGR = WHITE_BGR
     
-        if np.linalg.norm(drift_vector) > 1e-6:
-            _drift_norm = drift_vector / np.linalg.norm(drift_vector)
-        else:
-            _drift_norm = drift_vector
-        for _s in EMOTION_KEYS:
-            _anchor_norm = STAGE_ANCHORS[_s] / np.linalg.norm(STAGE_ANCHORS[_s])
-            target_sims[_s] = float(np.dot(_drift_norm, _anchor_norm))
+            if np.linalg.norm(drift_vector) > 1e-6:
+                _drift_norm = drift_vector / np.linalg.norm(drift_vector)
+            else:
+                _drift_norm = drift_vector
+            for _s in EMOTION_KEYS:
+                _anchor_norm = STAGE_ANCHORS[_s] / np.linalg.norm(STAGE_ANCHORS[_s])
+                target_sims[_s] = float(np.dot(_drift_norm, _anchor_norm))
     
-        if SMOOTHING_HALFLIFE_SECONDS > 0:
-            _alpha = 1.0 - 0.5 ** (dt / SMOOTHING_HALFLIFE_SECONDS)
-        else:
-            _alpha = 1.0
-        _alpha = max(0.0, min(1.0, _alpha))
-        for _k in EMOTION_KEYS:
-            displayed_sims[_k] += (target_sims[_k] - displayed_sims[_k]) * _alpha
+            if SMOOTHING_HALFLIFE_SECONDS > 0:
+                _alpha = 1.0 - 0.5 ** (dt / SMOOTHING_HALFLIFE_SECONDS)
+            else:
+                _alpha = 1.0
+            _alpha = max(0.0, min(1.0, _alpha))
+            for _k in EMOTION_KEYS:
+                displayed_sims[_k] += (target_sims[_k] - displayed_sims[_k]) * _alpha
     
-        h_img, w_img = annotated.shape[:2]
-        _content_left = _off_x
-        _content_top = _off_y
-        _content_right = _off_x + _new_w
-        _content_bottom = _off_y + _new_h
-        _layout_margin = 24
-        _panel_top = max(118, _content_top + 70)
-        _panel_bottom = min(h_img - 30, _content_bottom - 60)
-        _box_top = _panel_top
-        _box_bot = _panel_bottom
-        _box_r = min(w_img - _layout_margin, _content_right - _layout_margin)
-        _box_l = max(int(w_img * 0.62), _box_r - 420)
-        _ev_font = UI_FONT
-        _ev_fs = 0.62 * FONT_SCALE_MULT
-        _ev_ft = 1
-        _ev_bw = 72
-        _ev_bh = 6
-        _ev_lh = int(27 * FONT_SCALE_MULT)
-        _ev_gap = 8
-        _ev_ml = _content_left + _layout_margin
-        _info_fs = 0.62 * FONT_SCALE_MULT
-        _info_lh = int(27 * FONT_SCALE_MULT)
-        _info_left = _content_left + _layout_margin
-        (_info_sample_w, _info_sample_h), _ = cv2.getTextSize(info[0], UI_FONT, _info_fs, 1)
-        _info_top = _panel_top + _info_sample_h
-        _left_keys = ["calm", "questioning", "unraveling", "collapsing"]
-        _right_keys = ["soothed", "acknowledged", "small_talk", "self_murmur"]
-        _emotion_keys_for_rows = _left_keys + _right_keys
-        _ev_mt = _panel_bottom - (len(_emotion_keys_for_rows) * _ev_lh)
+            h_img, w_img = annotated.shape[:2]
+            _content_left = _off_x
+            _content_top = _off_y
+            _content_right = _off_x + _new_w
+            _content_bottom = _off_y + _new_h
+            _layout_margin = 24
+            _panel_top = max(118, _content_top + 70)
+            _panel_bottom = min(h_img - 30, _content_bottom - 60)
+            _box_top = _panel_top
+            _box_bot = _panel_bottom
+            _box_r = min(w_img - _layout_margin, _content_right - _layout_margin)
+            _box_l = max(int(w_img * 0.62), _box_r - 420)
+            _ev_font = UI_FONT
+            _ev_fs = 0.62 * FONT_SCALE_MULT
+            _ev_ft = 1
+            _ev_bw = 72
+            _ev_bh = 6
+            _ev_lh = int(27 * FONT_SCALE_MULT)
+            _ev_gap = 8
+            _ev_ml = _content_left + _layout_margin
+            _info_fs = 0.62 * FONT_SCALE_MULT
+            _info_lh = int(27 * FONT_SCALE_MULT)
+            _info_left = _content_left + _layout_margin
+            (_info_sample_w, _info_sample_h), _ = cv2.getTextSize(info[0], UI_FONT, _info_fs, 1)
+            _info_top = _panel_top + _info_sample_h
+            _left_keys = ["calm", "questioning", "unraveling", "collapsing"]
+            _right_keys = ["soothed", "acknowledged", "small_talk", "self_murmur"]
+            _emotion_keys_for_rows = _left_keys + _right_keys
+            _ev_mt = _panel_bottom - (len(_emotion_keys_for_rows) * _ev_lh)
     
-        _max_ltw = 0
-        for _k in _emotion_keys_for_rows:
-            (_tw, _), _ = cv2.getTextSize(f"{_k}:{displayed_sims[_k]:.2f}", _ev_font, _ev_fs, _ev_ft)
-            if _tw > _max_ltw:
-                _max_ltw = _tw
+            _max_ltw = 0
+            for _k in _emotion_keys_for_rows:
+                (_tw, _), _ = cv2.getTextSize(f"{_k}:{displayed_sims[_k]:.2f}", _ev_font, _ev_fs, _ev_ft)
+                if _tw > _max_ltw:
+                    _max_ltw = _tw
     
-        _l_text_left = _ev_ml
-        _l_bar_st = _l_text_left + _max_ltw + _ev_gap
+            _l_text_left = _ev_ml
+            _l_bar_st = _l_text_left + _max_ltw + _ev_gap
     
-        for i, line in enumerate(info):
-            cv2.putText(annotated, line, (_info_left, _info_top + i * _info_lh),
-                        UI_FONT, _info_fs, WHITE_BGR, 1)
+            for i, line in enumerate(info):
+                cv2.putText(annotated, line, (_info_left, _info_top + i * _info_lh),
+                            UI_FONT, _info_fs, WHITE_BGR, 1)
     
-        for _row, _k in enumerate(_emotion_keys_for_rows):
-            _sim = displayed_sims[_k]
-            _txt = f"{_k}:{_sim:.2f}"
-            (_tw, _th), _ = cv2.getTextSize(_txt, _ev_font, _ev_fs, _ev_ft)
-            _y = _ev_mt + _row * _ev_lh + _th
-            _bl = int(_ev_bw * max(0.0, min(1.0, _sim)))
-            _by = _y - _th // 2
-            if _bl > 0:
-                cv2.rectangle(annotated, (_l_bar_st, _by - _ev_bh // 2), (_l_bar_st + _bl, _by + _ev_bh // 2), EMOTION_COLOR_BGR, -1)
-            cv2.putText(annotated, _txt, (_l_bar_st - _ev_gap - _tw, _y), _ev_font, _ev_fs, EMOTION_COLOR_BGR, _ev_ft)
+            for _row, _k in enumerate(_emotion_keys_for_rows):
+                _sim = displayed_sims[_k]
+                _txt = f"{_k}:{_sim:.2f}"
+                (_tw, _th), _ = cv2.getTextSize(_txt, _ev_font, _ev_fs, _ev_ft)
+                _y = _ev_mt + _row * _ev_lh + _th
+                _bl = int(_ev_bw * max(0.0, min(1.0, _sim)))
+                _by = _y - _th // 2
+                if _bl > 0:
+                    cv2.rectangle(annotated, (_l_bar_st, _by - _ev_bh // 2), (_l_bar_st + _bl, _by + _ev_bh // 2), EMOTION_COLOR_BGR, -1)
+                cv2.putText(annotated, _txt, (_l_bar_st - _ev_gap - _tw, _y), _ev_font, _ev_fs, EMOTION_COLOR_BGR, _ev_ft)
     
-        # --- LLM dialogue box ---
-        _lbl_col = WHITE_BGR
+            # --- LLM dialogue box ---
+            _lbl_col = WHITE_BGR
     
-        _bfs = 0.47 * FONT_SCALE_MULT
-        _blh = int(20 * FONT_SCALE_MULT)
-        _bx = _box_l + 16
-        _by0 = _box_top + 28
-        _biw = _box_r - _box_l - 32
-        _avh = _box_bot - _by0 - 16
-        (_sp_w, _), _ = cv2.getTextSize(" ", UI_FONT, _bfs, 1)
-        _sp_w = max(4, _sp_w)
+            _bfs = 0.47 * FONT_SCALE_MULT
+            _blh = int(20 * FONT_SCALE_MULT)
+            _bx = _box_l + 16
+            _by0 = _box_top + 28
+            _biw = _box_r - _box_l - 32
+            _avh = _box_bot - _by0 - 16
+            (_sp_w, _), _ = cv2.getTextSize(" ", UI_FONT, _bfs, 1)
+            _sp_w = max(4, _sp_w)
     
-        _now_t = time.time()
-        for _e in llm_text_history:
-            if _e["censoring_started_at"] is not None and _e["censor_progress"] < 1.0:
-                _e["censor_progress"] = min(1.0, (_now_t - _e["censoring_started_at"]) / 0.5)
-        llm_text_history[:] = [_e for _e in llm_text_history if _e["censor_progress"] < 1.0]
-    
-        def _word_fragments(word):
-            fragments = []
-            current = ""
-            for ch in word:
-                candidate = current + ch
-                (tw_, _), _ = cv2.getTextSize(candidate, UI_FONT, _bfs, 1)
-                if current and tw_ > _biw:
-                    fragments.append(current)
-                    current = ch
-                else:
-                    current = candidate
-            if current:
-                fragments.append(current)
-            return fragments or [word]
-    
-        def _wrapped_words(text):
-            words = []
-            for word in text.split():
-                words.extend(_word_fragments(word))
-            return words
-    
-        def _wrapped_lines(words):
-            lines = []
-            line = []
-            line_w = 0
-            for wi, word in enumerate(words):
-                (ww, wh), _ = cv2.getTextSize(word, UI_FONT, _bfs, 1)
-                next_w = line_w + (_sp_w if line else 0) + ww
-                if line and next_w > _biw:
-                    lines.append(line)
-                    line = [(wi, word, ww, wh)]
-                    line_w = ww
-                else:
-                    line.append((wi, word, ww, wh))
-                    line_w = next_w if line_w else ww
-            if line:
-                lines.append(line)
-            return lines
-    
-        def _ent_h(e):
-            words = _wrapped_words(e["text"])
-            if not words:
-                return _blh
-            base = len(_wrapped_lines(words)) * _blh
-            if e.get("label"):
-                base += int(_blh * 0.85)
-            return base
-    
-        _tot_h = sum(_ent_h(_e) for _e in llm_text_history)
-        if len(llm_text_history) > 1:
-            _tot_h += (len(llm_text_history) - 1) * _blh
-        if _tot_h > _avh:
+            _now_t = time.time()
             for _e in llm_text_history:
-                if _e["censoring_started_at"] is None:
-                    _e["censoring_started_at"] = time.time()
-                    break
+                if _e["censoring_started_at"] is not None and _e["censor_progress"] < 1.0:
+                    _e["censor_progress"] = min(1.0, (_now_t - _e["censoring_started_at"]) / 0.5)
+            llm_text_history[:] = [_e for _e in llm_text_history if _e["censor_progress"] < 1.0]
     
-        _cy = _by0
-        for _ei, _e in enumerate(llm_text_history):
-            _entry_label = _e.get("label", "")
-            if _entry_label:
-                _entry_label_col = _e.get("label_color", _lbl_col)
-                cv2.putText(annotated, _entry_label, (_bx, _cy),
-                            UI_FONT, 0.38 * FONT_SCALE_MULT, _entry_label_col, 1)
-                _cy += int(_blh * 0.85)
-            _ws = _wrapped_words(_e["text"])
-            if not _ws:
-                _cy += _blh
-                continue
-            _nc = int(len(_ws) * _e["censor_progress"])
-            _lines_b = _wrapped_lines(_ws)
-            for _ln in _lines_b:
-                _lx = _bx
-                for (_wi, _wd, _ww, _wh) in _ln:
-                    if _wi < _nc:
-                        cv2.rectangle(annotated, (_lx, _cy - _wh), (_lx + _ww, _cy + 2), _lbl_col, -1)
+            def _word_fragments(word):
+                fragments = []
+                current = ""
+                for ch in word:
+                    candidate = current + ch
+                    (tw_, _), _ = cv2.getTextSize(candidate, UI_FONT, _bfs, 1)
+                    if current and tw_ > _biw:
+                        fragments.append(current)
+                        current = ch
                     else:
-                        cv2.putText(annotated, _wd, (_lx, _cy), UI_FONT, _bfs, WHITE_BGR, 1)
-                    _lx += _ww + _sp_w
-                _cy += _blh
-            if _ei < len(llm_text_history) - 1:
-                _cy += _blh
+                        current = candidate
+                if current:
+                    fragments.append(current)
+                return fragments or [word]
+    
+            def _wrapped_words(text):
+                words = []
+                for word in text.split():
+                    words.extend(_word_fragments(word))
+                return words
+    
+            def _wrapped_lines(words):
+                lines = []
+                line = []
+                line_w = 0
+                for wi, word in enumerate(words):
+                    (ww, wh), _ = cv2.getTextSize(word, UI_FONT, _bfs, 1)
+                    next_w = line_w + (_sp_w if line else 0) + ww
+                    if line and next_w > _biw:
+                        lines.append(line)
+                        line = [(wi, word, ww, wh)]
+                        line_w = ww
+                    else:
+                        line.append((wi, word, ww, wh))
+                        line_w = next_w if line_w else ww
+                if line:
+                    lines.append(line)
+                return lines
+    
+            def _ent_h(e):
+                words = _wrapped_words(e["text"])
+                if not words:
+                    return _blh
+                base = len(_wrapped_lines(words)) * _blh
+                if e.get("label"):
+                    base += int(_blh * 0.85)
+                return base
+    
+            _tot_h = sum(_ent_h(_e) for _e in llm_text_history)
+            if len(llm_text_history) > 1:
+                _tot_h += (len(llm_text_history) - 1) * _blh
+            if _tot_h > _avh:
+                for _e in llm_text_history:
+                    if _e["censoring_started_at"] is None:
+                        _e["censoring_started_at"] = time.time()
+                        break
+    
+            _cy = _by0
+            for _ei, _e in enumerate(llm_text_history):
+                _entry_label = _e.get("label", "")
+                if _entry_label:
+                    _entry_label_col = _e.get("label_color", _lbl_col)
+                    cv2.putText(annotated, _entry_label, (_bx, _cy),
+                                UI_FONT, 0.38 * FONT_SCALE_MULT, _entry_label_col, 1)
+                    _cy += int(_blh * 0.85)
+                _ws = _wrapped_words(_e["text"])
+                if not _ws:
+                    _cy += _blh
+                    continue
+                _nc = int(len(_ws) * _e["censor_progress"])
+                _lines_b = _wrapped_lines(_ws)
+                for _ln in _lines_b:
+                    _lx = _bx
+                    for (_wi, _wd, _ww, _wh) in _ln:
+                        if _wi < _nc:
+                            cv2.rectangle(annotated, (_lx, _cy - _wh), (_lx + _ww, _cy + 2), _lbl_col, -1)
+                        else:
+                            cv2.putText(annotated, _wd, (_lx, _cy), UI_FONT, _bfs, WHITE_BGR, 1)
+                        _lx += _ww + _sp_w
+                    _cy += _blh
+                if _ei < len(llm_text_history) - 1:
+                    _cy += _blh
     
     
-        cv2.imshow('YOLO-World + State', annotated)
+            cv2.imshow('YOLO-World + State', annotated)
 
         time.sleep(0.03)  # 手动限速 ~30fps（原先由摄像头帧率驱动）
 
-        key = cv2.waitKey(1) & 0xFF
-        window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
-        if key in (ord('q'), 27) or not window_open:
-            break
+        if SHOW_HUD:
+            key = cv2.waitKey(1) & 0xFF
+            window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
+            if key in (ord('q'), 27) or not window_open:
+                break
 
 except KeyboardInterrupt:
     print("\n[EXIT] Ctrl+C received")
 finally:
     whisper_tts.whisper_tts.stop()
     lyric_page.lyric_page.stop()
-    cv2.destroyAllWindows()
+    if SHOW_HUD:
+        cv2.destroyAllWindows()

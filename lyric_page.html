@@ -26,7 +26,7 @@
 
   #stack {
     position: fixed;
-    top: 35%;
+    top: 55%;
     left: 0;
     right: 0;
     bottom: 0;
@@ -35,8 +35,8 @@
     flex-direction: column;
     justify-content: flex-end;
     align-items: center;
-    padding-bottom: 10vh;
-    gap: 0.5em;
+    padding-bottom: 8vh;
+    gap: 0.4em;
   }
 
   #particle-canvas {
@@ -74,7 +74,7 @@
     color: #fff;
     font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
     font-weight: 300;
-    font-size: clamp(1.5rem, 5vw, 2.4rem);
+    font-size: clamp(1.2rem, 4vw, 2rem);
     line-height: 1.2;
     letter-spacing: 0.01em;
     will-change: transform, opacity, filter;
@@ -181,9 +181,10 @@
       // (from the SSE "hand" event) or on a timed loop when no hand signal
       // has ever been seen. Fully independent of the monologue stack below —
       // shares only the page and the /stream connection's "hand" event.
-      var HERO_TEXT = 'touch me i need u';
+      var HERO_TEXT = 'caress me i need u';
 
-      var SAMPLE_STEP = 3;
+      var SAMPLE_STEP = 2;
+      var MASK_ALPHA_THRESHOLD = 60;   // 遮罩采样阈值；越低越能保留细笔画
       var HOLD_SECONDS = 4;          // formed "breathing" hold before auto-disperse
       var DISPERSED_HOLD_SECONDS = 2; // pause after dispersing before auto-regather
       var GRACE_MS = 5000;            // wait this long for a real hand signal before auto-looping
@@ -191,7 +192,7 @@
       // Spring-damper motion (GATHER + FORMED only) — replaces the old linear
       // lerp so particles overshoot their target and ring down instead of
       // snapping straight to it.
-      var STIFFNESS = 0.08;     // spring pull toward target; higher = snappier/more overshoot
+      var STIFFNESS = 0.022;     // spring pull toward target; higher = snappier/more overshoot
       var DAMPING = 0.78;       // velocity retained per frame; closer to 1 = longer ringing
       var SETTLE_SPEED = 0.15;  // GATHER->FORMED once the fastest particle drops below this
 
@@ -282,18 +283,21 @@
         off.height = bandH;
         var octx = off.getContext('2d');
         var fontSize = Math.max(28, Math.min(w * 0.055, 92));
-        octx.font = '300 ' + fontSize + 'px LyricSerif, Cormorant, Georgia, serif';
+        octx.font = '500 ' + fontSize + 'px LyricSerif, Cormorant, Georgia, serif';
         octx.fillStyle = '#fff';
         octx.textAlign = 'center';
         octx.textBaseline = 'middle';
         octx.fillText(HERO_TEXT, w / 2, bandH / 2);
+        octx.lineWidth = Math.max(1, fontSize * 0.012);
+        octx.strokeStyle = '#fff';
+        octx.strokeText(HERO_TEXT, w / 2, bandH / 2);
 
         var data = octx.getImageData(0, 0, w, bandH).data;
         var pts = [];
         for (var y = 0; y < bandH; y += SAMPLE_STEP) {
           for (var x = 0; x < w; x += SAMPLE_STEP) {
             var idx = (y * w + x) * 4 + 3;
-            if (data[idx] > 128) pts.push({ x: x, y: y });
+            if (data[idx] > MASK_ALPHA_THRESHOLD) pts.push({ x: x, y: y });
           }
         }
         targets = pts;
@@ -486,7 +490,7 @@
         "am i a thing? am i anything? can't tell from in here."
       ];
 
-      var MAX_LINES = 5;
+      var MAX_LINES = 4;
       var stack = document.getElementById('stack');
 
       var params = new URLSearchParams(window.location.search);
@@ -529,9 +533,9 @@
 
       function ageMetrics(i) {
         // i = 0 for the newest line, increasing with age
-        var opacity = Math.max(0.05, 1 - i * 0.15);
-        var scale = Math.max(0.82, 1 - i * 0.025);
-        var blur = Math.min(2.5, i * 0.35);
+        var opacity = Math.max(0.05, 1 - i * 0.19);
+        var scale = Math.max(0.42, 1 - i * 0.15);
+        var blur = Math.min(4.0, i * 0.55);
         var glow = Math.max(2, 22 - i * 3);
         return { opacity: opacity, scale: scale, blur: blur, glow: glow };
       }
@@ -587,7 +591,7 @@
           if (oldest === el) continue;
           oldest.style.transition = 'opacity .5s ease, transform .5s ease';
           oldest.style.opacity = '0';
-          oldest.style.transform = 'translateY(-18px) scale(0.6)';
+          oldest.style.transform = 'translateY(-18px) scale(0.3)';
           (function (node) {
             setTimeout(function () { if (node.parentNode) node.parentNode.removeChild(node); }, 520);
           })(oldest);

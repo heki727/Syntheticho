@@ -1,7 +1,11 @@
+
+
+cd ~/Desktop/final\ Syntheticho/final_llm
+source ~/yolo_env/bin/activate
+python narcissus_main.py
+
 cd ~/Desktop/final\ Syntheticho/final_llm
 source ~/yolo_env/bin/activate
 python hand_osc.py
 
-cd ~/Desktop/final\ Syntheticho/final_llm
-source ~/yolo_env/bin/activate
-python demo_offline.py
+http://127.0.0.1:8137
