@@ -13,6 +13,7 @@ any failure prints one warning via _warn_once and degrades silently.
 """
 
 import os
+import json
 import time
 import queue
 import threading
@@ -63,7 +64,11 @@ height:100vh;margin:0;text-align:center;}</style></head>
 <script>
 var line = document.getElementById('line');
 var es = new EventSource('/stream');
-es.onmessage = function(e){ line.textContent = e.data; };
+es.onmessage = function(e){
+  var t = e.data;
+  try { var o = JSON.parse(e.data); if (o && typeof o.text === 'string') t = o.text; } catch(err) {}
+  line.textContent = t;
+};
 </script>
 </body></html>"""
 
@@ -73,6 +78,10 @@ _HEARTBEAT_SECONDS = 15
 # Sentinel tuple shape put on a subscriber queue to mark a hand-state frame,
 # distinct from the plain strings the monologue path already queues.
 _HAND_EVENT_MARKER = "__lyric_hand__"
+
+# Sentinel for a monologue frame that carries mood/stage metadata alongside the
+# text. Plain strings are still accepted on the same path for compatibility.
+_LINE_EVENT_MARKER = "__lyric_line__"
 
 _warned_once = {"start": False, "push": False, "stop": False}
 
@@ -163,6 +172,12 @@ class _LyricRequestHandler(BaseHTTPRequestHandler):
                     item = client_queue.get(timeout=_HEARTBEAT_SECONDS)
                     if isinstance(item, tuple) and len(item) == 2 and item[0] == _HAND_EVENT_MARKER:
                         self.wfile.write(f"event: hand\ndata: {item[1]}\n\n".encode("utf-8"))
+                    elif isinstance(item, tuple) and len(item) == 4 and item[0] == _LINE_EVENT_MARKER:
+                        payload = json.dumps(
+                            {"text": item[1], "mood": item[2], "stage": item[3]},
+                            ensure_ascii=False,
+                        )
+                        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     else:
                         safe_text = item.replace("\r", " ").replace("\n", " ")
                         self.wfile.write(f"data: {safe_text}\n\n".encode("utf-8"))
@@ -196,19 +211,23 @@ class _LyricHTTPServer(ThreadingHTTPServer):
     def is_running(self):
         return self._running
 
-    def broadcast(self, text):
+    def broadcast(self, text, mood=None, stage=None):
+        if mood is None and stage is None:
+            payload = text
+        else:
+            payload = (_LINE_EVENT_MARKER, text, mood, stage)
         with self._subscribers_lock:
             subs = list(self._subscribers)
         for q in subs:
             try:
-                q.put_nowait(text)
+                q.put_nowait(payload)
             except queue.Full:
                 try:
                     q.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    q.put_nowait(text)
+                    q.put_nowait(payload)
                 except queue.Full:
                     pass
 
@@ -309,13 +328,13 @@ class LyricPage:
             except Exception as e:
                 _warn_once("hand_osc", f"hand-state broadcast failed ({e})")
 
-    def push(self, text, is_reassemble=False):
+    def push(self, text, is_reassemble=False, mood=None, stage=None):
         if not self.enabled or self._server is None or not text:
             return
         if is_reassemble and not LYRIC_SHOW_REASSEMBLE:
             return
         try:
-            self._server.broadcast(text)
+            self._server.broadcast(text, mood=mood, stage=stage)
         except Exception as e:
             _warn_once("push", f"push failed ({e}); lyric page disabled")
 

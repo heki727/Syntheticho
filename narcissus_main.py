@@ -11,7 +11,6 @@ from collections import deque
 from dotenv import load_dotenv
 from names import NAME_POOL
 from sentence_transformers import SentenceTransformer
-import anthropic
 import cv2
 import numpy as np
 import time
@@ -51,7 +50,6 @@ REASSEMBLE_SECONDS = 20.0     # deprecated
 
 # ===== LLM 配置 =====
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
-ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 LLM_OFFLINE_FALLBACK = os.environ.get("LLM_OFFLINE_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
 LLM_MEMORY_WINDOW = 10
@@ -67,12 +65,6 @@ MONOLOGUE_MAX_CHARS = 110
 READ_PACE_CHARS_PER_SEC = 16.0
 READ_MIN_SECONDS = 3.0
 READ_MAX_SECONDS = 8.0
-
-# ===== LLM Clients =====
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-if LLM_PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"):
-    LLM_PROVIDER = "anthropic"
 
 # ===== Embedding model =====
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
@@ -1084,7 +1076,7 @@ def print_cycle_header():
 
 
 print(f"OSC → {OSC_IP}:{OSC_PORT}")
-_active_llm_model = OPENAI_MODEL if LLM_PROVIDER == "openai" else ANTHROPIC_MODEL
+_active_llm_model = OPENAI_MODEL
 print(f"LLM → {LLM_PROVIDER}:{_active_llm_model} (quiet; first success will be reported)")
 print_cycle_header()
 
@@ -1185,22 +1177,6 @@ def build_perception(signal_type):
     return PERCEPTION_STRINGS[stage]
 
 
-def call_anthropic_llm(system_with_name, messages):
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=LLM_MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": system_with_name,
-                "cache_control": {"type": "ephemeral"}
-            }
-        ],
-        messages=messages,
-    )
-    return "anthropic", ANTHROPIC_MODEL, response.content[0].text.strip()
-
-
 def call_openai_llm(system_with_name, messages):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -1231,8 +1207,6 @@ def call_llm(system_with_name, messages):
         raise RuntimeError("LLM_OFFLINE_FALLBACK is enabled")
     if time.time() < llm_remote_disabled_until:
         raise RuntimeError("LLM remote temporarily disabled after connection error")
-    if LLM_PROVIDER == "anthropic":
-        return call_anthropic_llm(system_with_name, messages)
     if LLM_PROVIDER == "openai":
         return call_openai_llm(system_with_name, messages)
     raise RuntimeError(f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}")
@@ -1313,7 +1287,10 @@ def normalize_llm_thought(thought):
         thought = thought.replace(src, dst)
     thought = re.sub(r"\?{4,}", "???", thought)
     thought = re.sub(r"!{4,}", "!!!", thought)
+    _pre_ascii = thought
     thought = thought.encode("ascii", errors="ignore").decode("ascii")
+    if len(thought) != len(_pre_ascii):
+        print(f"[LLM] dropped {len(_pre_ascii) - len(thought)} non-ascii chars")
     seen_question = False
     chars = []
     i = 0
@@ -1513,7 +1490,11 @@ def query_llm(signal_type, confidence, current_state, name):
 
     remember_cycle_thought(signal_type, current_state, active_stage, raw_thought)
     whisper_tts.whisper_tts.speak(thought, active_stage, signal_type, flower_val)
-    lyric_page.lyric_page.push(thought)
+    lyric_page.lyric_page.push(
+        thought,
+        mood=("happy" if signal_type == "OTHER" else "sad"),
+        stage=active_stage,
+    )
     label = f"{active_stage} | coh:{flower_val:.2f}"
     label_color = (30, 30, 220) if signal_type == "SELF" else (40, 150, 40)
     llm_text_history.append({
@@ -1577,7 +1558,7 @@ def print_reassemble_thought(progress):
         "created_at": time.time(),
         "label": label,
     })
-    lyric_page.lyric_page.push(thought, is_reassemble=True)
+    lyric_page.lyric_page.push(thought, is_reassemble=True, mood=None)
 
 
 def flower_to_dissolve(v):
@@ -1993,13 +1974,7 @@ try:
     
             cv2.imshow('YOLO-World + State', annotated)
 
-        time.sleep(0.03)  # 手动限速 ~30fps（原先由摄像头帧率驱动）
-
-        if SHOW_HUD:
-            key = cv2.waitKey(1) & 0xFF
-            window_open = cv2.getWindowProperty('YOLO-World + State', cv2.WND_PROP_VISIBLE) >= 1
-            if key in (ord('q'), 27) or not window_open:
-                break
+        time.sleep(0.03)  # 与循环头部 sleep(0.01) 合计约 40ms → ~25fps（原先由摄像头帧率驱动）
 
 except KeyboardInterrupt:
     print("\n[EXIT] Ctrl+C received")

@@ -163,6 +163,16 @@
     13%  { top: -80px; opacity: 0; }
     100% { top: 100%; opacity: 0; }
   }
+
+  .line-face {
+    width: 1.05em;
+    height: 1.05em;
+    margin-left: 0.45em;
+    vertical-align: -0.12em;
+    color: inherit;
+    filter: drop-shadow(0 0 4px rgba(255,255,255,0.55));
+    flex: none;
+  }
 </style>
 </head>
 <body>
@@ -577,7 +587,65 @@
         el.dataset.scale = String(m.scale);
       }
 
-      function addLine(text) {
+      // 13x13 pixel line-art faces. '#' = lit pixel, '.' = empty.
+      var FACE_BITMAPS = {
+        happy: [
+          '.....###.....',
+          '...##...##...',
+          '..#.......#..',
+          '.#.........#.',
+          '.#..#...#..#.',
+          '#...........#',
+          '#...........#',
+          '#..#.....#..#',
+          '.#..#...#..#.',
+          '.#...###...#.',
+          '..#.......#..',
+          '...##...##...',
+          '.....###.....'
+        ],
+        sad: [
+          '.....###.....',
+          '...##...##...',
+          '..#.......#..',
+          '.#...#.#...#.',
+          '.#..#...#..#.',
+          '#...........#',
+          '#...........#',
+          '#....###....#',
+          '.#.##...##.#.',
+          '.#.........#.',
+          '..#.......#..',
+          '...##...##...',
+          '.....###.....'
+        ]
+      };
+
+      function buildFace(mood) {
+        var rows = FACE_BITMAPS[mood];
+        if (!rows) return null;
+        var svgNS = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('viewBox', '0 0 13 13');
+        svg.setAttribute('shape-rendering', 'crispEdges');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.classList.add('line-face');
+        for (var y = 0; y < rows.length; y++) {
+          for (var x = 0; x < rows[y].length; x++) {
+            if (rows[y].charAt(x) !== '#') continue;
+            var r = document.createElementNS(svgNS, 'rect');
+            r.setAttribute('x', x);
+            r.setAttribute('y', y);
+            r.setAttribute('width', '1');
+            r.setAttribute('height', '1');
+            r.setAttribute('fill', 'currentColor');
+            svg.appendChild(r);
+          }
+        }
+        return svg;
+      }
+
+      function addLine(text, mood) {
         text = (text || '').trim();
         if (!text) return;
 
@@ -596,6 +664,10 @@
         textSpan.textContent = text;
         el.appendChild(logo);
         el.appendChild(textSpan);
+        if (mood) {
+          var face = buildFace(mood);
+          if (face) el.appendChild(face);
+        }
         el.style.transition = 'none';
         el.style.opacity = '0';
         el.style.transform = 'translateY(24px) scale(0.92)';
@@ -653,7 +725,17 @@
             stopDemoLoop();
           }
           setStatus('live');
-          addLine(e.data);
+          var text = e.data;
+          var mood = null;
+          try {
+            var obj = JSON.parse(e.data);
+            if (obj && typeof obj.text === 'string') {
+              text = obj.text;
+              mood = obj.mood || null;
+              // obj.stage 也可用，本次不显示，留作后续暴露层接口
+            }
+          } catch (err) { /* 纯文本帧，按原样处理 */ }
+          addLine(text, mood);
         };
         es.onopen = function () {
           setStatus(gotRealMessage ? 'live' : 'connected');
