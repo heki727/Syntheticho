@@ -955,8 +955,7 @@
       function enterReuniting(totalSeconds) {
         if (reunitingActive) return;
         reunitingActive = true;
-        // TEMP diagnostic (A0) — remove once the early-exit cause is confirmed.
-        console.log('[diag] enterReuniting @', new Date().toISOString(), 'totalSeconds=', totalSeconds);
+
 
         window.__lyricReuniting = true;
         if (window.__setLyricHero && window.__LYRIC_HERO) {
