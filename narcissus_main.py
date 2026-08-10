@@ -41,6 +41,13 @@ REUNITING_SILENT_SECONDS = 3.0
 # REASSEMBLE_RATE: flower_val 每秒上升量。1/40 = 40 秒走完全程。
 DISSOLVE_RATE = 1.0 / 40.0
 REASSEMBLE_RATE = 1.0 / 40.0
+# REUNITING_REBUILD_RATE: 仅用于 REUNITING 的 rebuild 阶段，与 ASSEMBLING 的
+# REASSEMBLE_RATE 解耦 —— 前者是"一个循环结束后重生"的固定演出时长，后者是
+# 有人在场时的实时响应速度，两者节奏诉求不同。
+REUNITING_REBUILD_SECONDS = 12.0
+REUNITING_REBUILD_RATE = 1.0 / REUNITING_REBUILD_SECONDS
+# REUNITING 全程 = silent + rebuild。歌词页倒计时直接用它，避免两处各写一遍。
+REUNITING_TOTAL_SECONDS = REUNITING_SILENT_SECONDS + REUNITING_REBUILD_SECONDS  # 15.0
 DISSOLVE_OUT_MIN = 0.12    # 发给 TD 的 dissolve 下限；花最凝聚时也不完全实心
 DISSOLVE_OUT_MAX = 0.80    # 上限；保证 TD 侧 attract gain 不归零，粒子飞不出画面
 DISSOLVE_EASE = True       # 是否对 flower_val 施加 smoothstep 缓动
@@ -697,6 +704,7 @@ osc = SimpleUDPClient(OSC_IP, OSC_PORT)
 state = "WAITING"
 reuniting_phase = None                # None | "silent" | "rebuild"
 reuniting_silent_until = 0.0          # timestamp when silent phase ends
+dissolve_frozen = False  # 当前 DISSOLVING 是否被他者在场冻结（用于边沿检测，打一次性日志）
 state_entered_at = time.time()
 last_frame_at = state_entered_at
 flower_val = 1.0
@@ -851,9 +859,9 @@ PERSONALITY_PROFILES = [
         "prompt": (
             "- Tone: catlike, self-possessed, curious, a little aloof.\n"
             "- You decide closeness on your own terms. You may pretend not to need the person while clearly staying near.\n"
-            "- The actual thought goes inside parentheses in lowercase English.\n"
             "- Use catlike attitudes: hm, no, closer is acceptable, i was already doing that.\n"
-            "- Write a plain short thought in lowercase English. Do not write any meow sounds — they are added afterwards."
+            "- Write a plain short thought in lowercase English. Do not write any meow sounds — they are added afterwards.\n"
+            "- Do not use parentheses yourself."
         ),
         "meta": "- Meta style: readings are rude little labels placed on you. Example: coherence rose. i allowed that, apparently.",
     },
@@ -868,6 +876,18 @@ PERSONALITY_PROFILES = [
         "meta": "- Meta style: readings become stage omens. 'coherence climbs, and lo, the little meter flatters me.'",
     },
 ]
+
+# 人格抽样权重：未列出的一律按 1.0。cat 的表现方式（meow 包裹）辨识度过强，
+# 出现太密会盖过其它人格，所以压到基准的三分之一左右。
+PERSONALITY_WEIGHTS = {
+    "cat": 0.35,
+}
+
+
+def pick_personality():
+    weights = [PERSONALITY_WEIGHTS.get(p["name"], 1.0) for p in PERSONALITY_PROFILES]
+    return random.choices(PERSONALITY_PROFILES, weights=weights, k=1)[0]
+
 
 STORY_THREADS = [
     {
@@ -898,7 +918,7 @@ STORY_THREADS = [
 
 cycle_count = 1
 current_name = random.choice(NAME_POOL)
-current_personality = random.choice(PERSONALITY_PROFILES)
+current_personality = pick_personality()
 current_story_thread = random.choice(STORY_THREADS)
 
 tof_presence = False  # Raw ToF/Arduino state: object is close enough.
@@ -919,6 +939,8 @@ HAND_SIGNAL_TIMEOUT = 2.0   # 超过此秒数没收到 /handon → 视为无手�
 hand_on = 0.0
 last_hand_msg_at = 0.0
 last_tof_broadcast_at = 0.0
+last_uniting_broadcast_at = 0.0
+last_uniting_broadcast_value = None
 last_presence_edge = None
 last_combined_presence = None
 
@@ -1066,7 +1088,7 @@ SMALL_TALK_THRESHOLD_SECONDS = 30.0
 
 # Reassemble 节奏
 last_reassemble_print = 0.0
-REASSEMBLE_PRINT_INTERVAL = 3.0
+REASSEMBLE_PRINT_INTERVAL = 2.0
 
 
 def print_cycle_header():
@@ -1382,7 +1404,13 @@ def format_cat_thought(thought, stage):
     if choice == _last_cat_meow and len(candidates) > 1:
         choice = random.choice(candidates)
     _last_cat_meow = choice
-    return choice
+
+    # 模型偶尔会自己带括号，去掉外层再包一次，避免 "meow ((hello))"
+    inner = (thought or "").strip()
+    inner = re.sub(r"^\((.*)\)$", r"\1", inner, flags=re.S).strip()
+    if not inner:
+        return choice
+    return f"{choice} ({inner})"
 
 
 def remember_cycle_thought(signal_type, current_state, stage, thought):
@@ -1447,33 +1475,53 @@ def query_llm(signal_type, confidence, current_state, name):
     perception = build_perception(signal_type)
     continuity_prompt = build_cycle_memory_prompt(signal_type, current_state, name, perception)
 
-    try:
-        messages = list(FEW_SHOT_EXAMPLES) + list(llm_conversation) + [
-            {"role": "user", "content": continuity_prompt}
-        ]
-
-        system_with_name = SYSTEM_PROMPT.format(
-            name=name,
-            personality_name=current_personality["name"],
-            personality_prompt=current_personality["prompt"],
-            meta_prompt=current_personality["meta"],
-            thread_name=current_story_thread["name"],
-            thread_prompt=current_story_thread["prompt"],
-        )
-        llm_source, llm_model, thought = call_llm(system_with_name, messages)
-        if not llm_connection_reported:
-            print(f"[LLM] connected → {llm_source}:{llm_model}")
-            llm_connection_reported = True
-
-    except Exception as e:
-        llm_remote_disabled_until = time.time() + LLM_ERROR_BACKOFF_SECONDS
-        if not llm_connection_reported:
-            print(f"[LLM] remote unavailable; using local fallback: {e}")
-            llm_connection_reported = True
+    if time.time() < llm_remote_disabled_until:
+        # Still inside a previous failure's backoff window. Skip the network
+        # call entirely — going through call_llm()/except here would just
+        # hit its own backoff guard and re-arm another LLM_ERROR_BACKOFF_SECONDS,
+        # which (since triggers fire far more often than the backoff length)
+        # never lets the window expire and permanently locks out real calls.
         thought = local_llm_fallback(perception, signal_type)
+        print(f"[LLM] backoff active ({llm_remote_disabled_until - time.time():.0f}s left) — state={current_state} signal={signal_type} → fallback")
+    else:
+        try:
+            messages = list(FEW_SHOT_EXAMPLES) + list(llm_conversation) + [
+                {"role": "user", "content": continuity_prompt}
+            ]
+
+            system_with_name = SYSTEM_PROMPT.format(
+                name=name,
+                personality_name=current_personality["name"],
+                personality_prompt=current_personality["prompt"],
+                meta_prompt=current_personality["meta"],
+                thread_name=current_story_thread["name"],
+                thread_prompt=current_story_thread["prompt"],
+            )
+            llm_source, llm_model, thought = call_llm(system_with_name, messages)
+            print(f"[LLM] ok — state={current_state} signal={signal_type}")
+            if not llm_connection_reported:
+                print(f"[LLM] connected → {llm_source}:{llm_model}")
+                llm_connection_reported = True
+
+        except Exception as e:
+            llm_remote_disabled_until = time.time() + LLM_ERROR_BACKOFF_SECONDS
+            print(f"[LLM] failed — state={current_state} signal={signal_type}: {e}")
+            if not llm_connection_reported:
+                print(f"[LLM] remote unavailable; using local fallback: {e}")
+                llm_connection_reported = True
+            thought = local_llm_fallback(perception, signal_type)
 
     thought = normalize_llm_thought(thought)
     raw_thought = thought
+
+    if state != current_state:
+        # The scene moved on (e.g. DISSOLVING -> REUNITING) while this
+        # request was in flight — the state machine doesn't wait on us.
+        # Discard the stale result instead of pushing text/speech that no
+        # longer matches what's currently on screen.
+        print(f"[LLM] stale result discarded — triggered for state={current_state}, now state={state}")
+        llm_running = False
+        return
 
     llm_conversation.append({"role": "user", "content": continuity_prompt})
     llm_conversation.append({"role": "assistant", "content": raw_thought})
@@ -1684,20 +1732,35 @@ try:
                 print(f"\n[{time.strftime('%H:%M:%S')}] → DISSOLVING — SHOCK incoming")
     
         elif state == "DISSOLVING":
-            flower_val = max(0.0, flower_val - DISSOLVE_RATE * dt)
             if HAND_DRIVES_FLOWER and presence:
+                flower_val = max(0.0, flower_val - DISSOLVE_RATE * dt)
                 state = "ASSEMBLING"
                 state_entered_at = now
                 remember_cycle_event("outside evidence returned; a person is close enough to interrupt the mirror.")
                 print(f"\n[{time.strftime('%H:%M:%S')}] → ASSEMBLING (presence returned)")
-            elif flower_val <= 0.001:
-                state = "REUNITING"
-                reuniting_phase = "silent"
-                reuniting_silent_until = now + REUNITING_SILENT_SECONDS
-                state_entered_at = now
-                last_reassemble_print = now - REASSEMBLE_PRINT_INTERVAL
-                remember_cycle_event("confirmation failed for this cycle; silence and rebuilding begin.")
-                print(f"\n[{time.strftime('%H:%M:%S')}] → REUNITING (silent {REUNITING_SILENT_SECONDS}s)")
+            elif presence:
+                # 他者在场时冻结消散：flower_val 原地不动，不衰减也不回升。
+                # 花朵的死亡被他者的在场推迟，而不是被逆转 —— 手只能让它停
+                # 下，不能让它长回来。死亡边缘同样被挡住：即使已经归零，只
+                # 要人还在，就停在崩溃边缘不进 REUNITING。
+                if not dissolve_frozen:
+                    dissolve_frozen = True
+                    print(f"[HOLD] dissolving frozen by presence — coh:{flower_val:.2f}")
+            else:
+                if dissolve_frozen:
+                    dissolve_frozen = False
+                    print(f"[HOLD] released — coh:{flower_val:.2f}")
+                flower_val = max(0.0, flower_val - DISSOLVE_RATE * dt)
+                if flower_val <= 0.001 and not presence:
+                    state = "REUNITING"
+                    reuniting_phase = "silent"
+                    reuniting_silent_until = now + REUNITING_SILENT_SECONDS
+                    state_entered_at = now
+                    last_reassemble_print = now - REASSEMBLE_PRINT_INTERVAL
+                    remember_cycle_event("confirmation failed for this cycle; silence and rebuilding begin.")
+                    whisper_tts.whisper_tts.interrupt()
+                    lyric_page.lyric_page.reuniting(seconds=REUNITING_TOTAL_SECONDS)
+                    print(f"\n[{time.strftime('%H:%M:%S')}] → REUNITING (silent {REUNITING_SILENT_SECONDS}s)")
     
         elif state == "REUNITING":
             if reuniting_phase == "silent":
@@ -1706,14 +1769,14 @@ try:
                     reuniting_phase = "rebuild"
                     print(f"\n[{time.strftime('%H:%M:%S')}] → REUNITING rebuild phase")
             elif reuniting_phase == "rebuild":
-                flower_val = min(1.0, flower_val + REASSEMBLE_RATE * dt)
+                flower_val = min(1.0, flower_val + REUNITING_REBUILD_RATE * dt)
                 if flower_val >= 0.999:
                     # cycle complete — pick next state based on actual servo/presence state
                     reuniting_phase = None
                     state_entered_at = now
                     cycle_count += 1
                     current_name = random.choice(NAME_POOL)
-                    current_personality = random.choice(PERSONALITY_PROFILES)
+                    current_personality = pick_personality()
                     current_story_thread = random.choice(STORY_THREADS)
                     llm_conversation.clear()
                     cycle_memory.clear()
@@ -1748,7 +1811,21 @@ try:
             send_serial_command("UNITING_OFF\n")
             uniting_serial_active = False
             last_uniting_serial_sent = now
-    
+
+        # uniting 门控：REUNITING 期间通知 hand_osc.py 切断手追数据。
+        # 与 /tofon 分开走，语义不同：/tofon 是"有没有人"，/uniting 是"现在不接受输入"。
+        # 必须放在这里（状态机分支跑完之后），而不是紧挨着上面 /tofon 广播的位置——
+        # /tofon 那段在本帧状态机更新之前执行，读到的是上一帧的 state；这里才是
+        # 这一帧真正生效的 state。
+        uniting_now = (state == "REUNITING")
+        if uniting_now != last_uniting_broadcast_value or now - last_uniting_broadcast_at >= 0.5:
+            try:
+                tof_osc.send_message("/uniting", 1.0 if uniting_now else 0.0)
+            except Exception:
+                pass
+            last_uniting_broadcast_value = uniting_now
+            last_uniting_broadcast_at = now
+
         # === OSC (silent 阶段仍发 /dissolve 与 /dissolve_amount，固定为 DISSOLVE_OUT_MAX，
         #     避免 TD 侧 attract gain 在这几秒内归零、粒子无约束逃逸；/confidence 保持跳过) ===
         is_reuniting_silent = state == "REUNITING" and reuniting_phase == "silent"

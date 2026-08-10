@@ -83,7 +83,12 @@ _HAND_EVENT_MARKER = "__lyric_hand__"
 # text. Plain strings are still accepted on the same path for compatibility.
 _LINE_EVENT_MARKER = "__lyric_line__"
 
-_warned_once = {"start": False, "push": False, "stop": False}
+# Sentinel marking the start of the REUNITING state: the page clears all
+# current lines and shows a loading indicator until the next real line
+# arrives (start of the next cycle).
+_REUNITING_EVENT_MARKER = "__lyric_reuniting__"
+
+_warned_once = {"start": False, "push": False, "stop": False, "reuniting": False}
 
 
 def _warn_once(key, msg):
@@ -172,6 +177,8 @@ class _LyricRequestHandler(BaseHTTPRequestHandler):
                     item = client_queue.get(timeout=_HEARTBEAT_SECONDS)
                     if isinstance(item, tuple) and len(item) == 2 and item[0] == _HAND_EVENT_MARKER:
                         self.wfile.write(f"event: hand\ndata: {item[1]}\n\n".encode("utf-8"))
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] == _REUNITING_EVENT_MARKER:
+                        self.wfile.write(f"event: reuniting\ndata: {item[1]}\n\n".encode("utf-8"))
                     elif isinstance(item, tuple) and len(item) == 4 and item[0] == _LINE_EVENT_MARKER:
                         payload = json.dumps(
                             {"text": item[1], "mood": item[2], "stage": item[3]},
@@ -233,6 +240,24 @@ class _LyricHTTPServer(ThreadingHTTPServer):
 
     def broadcast_hand(self, state):
         payload = (_HAND_EVENT_MARKER, "1" if state else "0")
+        with self._subscribers_lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    pass
+
+    def broadcast_reuniting(self, seconds=None):
+        data = f"{seconds:.0f}" if seconds is not None else "0"
+        payload = (_REUNITING_EVENT_MARKER, data)
         with self._subscribers_lock:
             subs = list(self._subscribers)
         for q in subs:
@@ -337,6 +362,19 @@ class LyricPage:
             self._server.broadcast(text, mood=mood, stage=stage)
         except Exception as e:
             _warn_once("push", f"push failed ({e}); lyric page disabled")
+
+    def reuniting(self, seconds=None):
+        """Signal the page to clear all lines and show a loading state.
+        `seconds`, if given, is the estimated total REUNITING duration so
+        the page can show a countdown. Stays up until the next real push()
+        call (first line of the new cycle), which clears it on the front
+        end regardless of whether the countdown has finished."""
+        if not self.enabled or self._server is None:
+            return
+        try:
+            self._server.broadcast_reuniting(seconds=seconds)
+        except Exception as e:
+            _warn_once("reuniting", f"reuniting broadcast failed ({e})")
 
     def stop(self):
         if self._osc_server is not None:

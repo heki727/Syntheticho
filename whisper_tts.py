@@ -33,7 +33,7 @@ except Exception as _e:  # pragma: no cover - environment dependent
 TTS_ENABLE = os.environ.get("TTS_ENABLE", "1") == "1"   # 总开关，默认开
 SPEAK_REASSEMBLE = os.environ.get("TTS_SPEAK_REASSEMBLE", "0") == "1"  # 是否朗读机械读数
 OUTPUT_DEVICE = os.environ.get("TTS_OUTPUT_DEVICE", "")  # 空=默认设备；可填 sounddevice 设备名/索引
-CAT_BRACKETS_ONLY = os.environ.get("TTS_CAT_BRACKETS_ONLY", "1") == "1"  # cat 人格是否只念括号内文本
+CAT_STRIP_BRACKETS = os.environ.get("TTS_CAT_STRIP_BRACKETS", "1") == "1"  # cat 人格：TTS 跳过括号内的人话
 
 QUEUE_MAX = 2               # 积压超过就丢最旧（现场不要越念越滞后）
 INTERRUPT_ON_NEW = True     # 新独白到来是否打断当前在念的
@@ -323,9 +323,11 @@ def split_fragments(text, frag_prob):
     return result
 
 
-def extract_cat_bracket_text(thought):
-    match = re.search(r"\((.*)\)", thought, flags=re.S)
-    return match.group(1).strip() if match else thought
+def strip_cat_bracket_text(thought):
+    """cat 人格：括号里是人话，只供屏幕阅读；TTS 只念括号外的 meow。"""
+    out = re.sub(r"\([^)]*\)", " ", thought)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out if out else thought
 
 
 # --------------------------------------------------------------------------
@@ -365,8 +367,8 @@ class WhisperTTS:
         if not self._running:
             return
 
-        if CAT_BRACKETS_ONLY and "(" in text and ")" in text:
-            text = extract_cat_bracket_text(text)
+        if CAT_STRIP_BRACKETS and "(" in text and ")" in text:
+            text = strip_cat_bracket_text(text)
         if not text.strip():
             return
 
@@ -405,8 +407,11 @@ class WhisperTTS:
                     try:
                         sig, sr = self._backend.synth(frag_text, voice["rate"])
                     except Exception as e:
-                        _warn_once("engine", f"synthesis unavailable ({e}); whisper TTS disabled")
-                        self._running = False
+                        # Skip just this line, not the rest of the session — a single
+                        # flaky synth call used to permanently disable all future TTS
+                        # (self._running = False here, with nothing ever setting it
+                        # back to True) until the whole process was restarted.
+                        _warn_once("engine", f"synthesis failed, skipping this line ({e})")
                         break
                     sig = whisperize(sig, sr, voice)
                     if self._stop_current.is_set() or not self._running:
@@ -416,8 +421,29 @@ class WhisperTTS:
                     if pause_after > 0:
                         time.sleep(pause_after)
             except Exception as e:
-                _warn_once("engine", f"playback error ({e}); whisper TTS disabled")
-                self._running = False
+                # Same fix as above: one bad playback shouldn't kill TTS for the
+                # rest of the run. Move on to the next queued line instead.
+                _warn_once("engine", f"playback failed, skipping this line ({e})")
+
+    def interrupt(self):
+        """Cut whatever is currently playing and drop anything still queued,
+        without shutting down the worker thread (unlike stop()). For scene
+        changes where old speech no longer belongs — e.g. entering REUNITING
+        mid-sentence: that self is already gone, so its sentence shouldn't
+        finish. The worker stays alive and speaks normally again once the
+        next cycle's real text arrives."""
+        if not self.enabled or not _AUDIO_OK:
+            return
+        self._stop_current.set()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
     def stop(self):
         self._running = False

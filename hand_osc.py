@@ -79,6 +79,9 @@ ESP_OSC_PORT = 10729      # narcissus_main.py 在此端口接收 /handon（参�
 TOF_LISTEN_PORT = 10730   # narcissus_main.py 在此端口广播 /tofon（ToF 有人=1 / 没人=0）
 TOF_GATE_TIMEOUT = 5.0    # 超过此秒数没收到 /tofon → 认为 narcissus_main.py 未运行，门保持打开
 
+UNITING_GATE_ENABLE = True   # True = REUNITING 期间切断手追数据（作品逻辑：崩塌时不接受输入）
+UNITING_GATE_TIMEOUT = 5.0   # 超过此秒数没收到 /uniting → 认为 narcissus_main.py 未运行，门保持打开
+
 SHOW_WINDOW = False
 DEBUG_PRINT_POS = True   # print live hand x/y/on to the terminal
 DEBUG_PRINT_INTERVAL = 0.2  # seconds between prints, so it doesn't flood at 30fps
@@ -177,17 +180,35 @@ def main():
         tof_state["on"] = v >= 0.5
         tof_state["at"] = time.time()
 
-    if TOF_GATE_ENABLE:
+    # uniting 门控状态：narcissus_main.py 在 REUNITING 期间广播 /uniting。
+    # 注意默认值是 False（门开），跟 tof_state 的 True 语义相反——
+    # /tofon 表示"有没有人"（默认有人/门开），/uniting 表示"现在要不要封锁"
+    # （默认不封锁/门开）。两者都是"默认开门"，但达成"开"的默认值刚好相反。
+    uniting_state = {"on": False, "at": 0.0}
+
+    def _on_uniting(addr, *args):
+        try:
+            v = float(args[0]) if args else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        uniting_state["on"] = v >= 0.5
+        uniting_state["at"] = time.time()
+
+    # /tofon 和 /uniting 共用同一个监听器/端口，两个门控独立生效，谁开启就 map 谁。
+    if TOF_GATE_ENABLE or UNITING_GATE_ENABLE:
         _tof_dispatcher = Dispatcher()
-        _tof_dispatcher.map("/tofon", _on_tofon)
+        if TOF_GATE_ENABLE:
+            _tof_dispatcher.map("/tofon", _on_tofon)
+        if UNITING_GATE_ENABLE:
+            _tof_dispatcher.map("/uniting", _on_uniting)
         try:
             _tof_server = ThreadingOSCUDPServer(("127.0.0.1", TOF_LISTEN_PORT), _tof_dispatcher)
             threading.Thread(target=_tof_server.serve_forever, daemon=True).start()
-            print(f"[hand_osc] listening for /tofon on 127.0.0.1:{TOF_LISTEN_PORT}")
+            print(f"[hand_osc] listening for /tofon,/uniting on 127.0.0.1:{TOF_LISTEN_PORT}")
         except OSError as e:
-            print(f"[hand_osc] tof listener failed to bind :{TOF_LISTEN_PORT} ({e}); gate stays open")
+            print(f"[hand_osc] tof/uniting listener failed to bind :{TOF_LISTEN_PORT} ({e}); both gates stay open")
     else:
-        print("[hand_osc] ToF gate disabled — hand tracking runs independently")
+        print("[hand_osc] ToF gate and uniting gate both disabled — hand tracking runs independently")
     esp_client = SimpleUDPClient(ESP_OSC_IP, ESP_OSC_PORT) if ESP_FORWARD_ENABLE else None
 
     cam_index = resolve_camera_index()
@@ -221,6 +242,7 @@ def main():
     hand_off_streak = HAND_OFF_FRAMES  # start "off" so no false hand-on at launch
     read_fail_streak = 0  # consecutive cap.read() failures; triggers reconnect at 30 (~1s @30fps)
     last_debug_print_at = 0.0
+    last_uniting_blocked = False  # edge-tracks the gate so the log line only fires on change
 
     print(f"[hand_osc] streaming /handx /handy /handon → {OSC_IP}:{OSC_PORT}")
     print("[hand_osc] Ctrl+C to stop")
@@ -290,7 +312,21 @@ def main():
                     tof_gate_open = True
                 if not tof_gate_open:
                     hand_on = 0.0
-                if tof_gate_open and smoothed_x is not None:
+
+                # uniting 门控：REUNITING 期间（narcissus_main.py 广播 /uniting 1.0）
+                # 花完全崩塌，不接受任何输入——坐标不发，handon 强制 0。
+                # 收不到 /uniting 超过 UNITING_GATE_TIMEOUT → 门保持打开，独立运行。
+                if UNITING_GATE_ENABLE:
+                    uniting_blocked = uniting_state["on"] and (time.time() - uniting_state["at"]) <= UNITING_GATE_TIMEOUT
+                else:
+                    uniting_blocked = False
+                if uniting_blocked:
+                    hand_on = 0.0
+                if uniting_blocked != last_uniting_blocked:
+                    print(f"[hand_osc] uniting gate {'CLOSED — hand data withheld' if uniting_blocked else 'OPEN'}")
+                    last_uniting_blocked = uniting_blocked
+
+                if tof_gate_open and not uniting_blocked and smoothed_x is not None:
                     osc_client.send_message("/handx", float(smoothed_x))
                     osc_client.send_message("/handy", float(smoothed_y))
                 osc_client.send_message("/handon", float(hand_on))

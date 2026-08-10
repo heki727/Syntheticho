@@ -173,6 +173,77 @@
     filter: drop-shadow(0 0 4px rgba(255,255,255,0.55));
     flex: none;
   }
+
+  .reuniting-overlay {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.85em;
+  }
+
+  .reuniting-spinner {
+    position: relative;
+    width: 26px;
+    height: 26px;
+  }
+  .reuniting-spinner i {
+    position: absolute;
+    width: 4px;
+    height: 4px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255,255,255,0.8);
+    animation: reuniting-blink 1.2s steps(1, end) infinite;
+  }
+  .reuniting-spinner i:nth-child(1) { top: 0;    left: 11px; animation-delay: 0s; }
+  .reuniting-spinner i:nth-child(2) { top: 4px;  left: 18px; animation-delay: -1.05s; }
+  .reuniting-spinner i:nth-child(3) { top: 11px; left: 22px; animation-delay: -0.9s; }
+  .reuniting-spinner i:nth-child(4) { top: 18px; left: 18px; animation-delay: -0.75s; }
+  .reuniting-spinner i:nth-child(5) { top: 22px; left: 11px; animation-delay: -0.6s; }
+  .reuniting-spinner i:nth-child(6) { top: 18px; left: 4px;  animation-delay: -0.45s; }
+  .reuniting-spinner i:nth-child(7) { top: 11px; left: 0;    animation-delay: -0.3s; }
+  .reuniting-spinner i:nth-child(8) { top: 4px;  left: 4px;  animation-delay: -0.15s; }
+
+  @keyframes reuniting-blink {
+    0%, 100% { opacity: 0.15; }
+    12.5% { opacity: 1; }
+  }
+
+  .reuniting-caption {
+    font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
+    font-weight: 300;
+    font-size: clamp(0.9rem, 2.6vw, 1.3rem);
+    letter-spacing: 0.16em;
+    text-transform: lowercase;
+    color: #fff;
+    animation: reuniting-caption-pulse 2.4s ease-in-out infinite;
+  }
+  /* Dots and seconds are separate fixed-width slots (not one shared string)
+     so the digits never shift horizontally as the dot count animates. */
+  .reuniting-dots {
+    display: inline-block;
+    width: 1.4em;
+    text-align: left;
+  }
+  .reuniting-secs {
+    display: inline-block;
+    width: 2.6em;
+    text-align: left;
+    /* Same font as the LLM output text (.line) and the "reuniting" caption
+       itself, for a unified look. Previously this was forced to a system
+       sans because the serif's oldstyle figures don't share a common
+       baseline/height (misaligned digits when they change every second);
+       lining-nums asks the font for uniform-height digits instead — if
+       'LyricSerif' doesn't expose that OpenType feature, the old
+       misalignment can resurface and this may need revisiting. */
+    font-family: 'LyricSerif', 'Cormorant', 'EB Garamond', Georgia, 'Times New Roman', serif;
+    font-variant-numeric: lining-nums tabular-nums;
+    letter-spacing: normal;
+  }
+
+  @keyframes reuniting-caption-pulse {
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 0.95; }
+  }
 </style>
 </head>
 <body>
@@ -186,18 +257,55 @@
 
   <script>
     (function () {
-      // Particle hero text: gathers into HERO_TEXT in the top ~40% band,
+      // Particle hero text: gathers into heroText in the top ~40% band,
       // glitches while formed, and dissolves/reforms on hand-state edges
       // (from the SSE "hand" event) or on a timed loop when no hand signal
       // has ever been seen. Fully independent of the monologue stack below —
       // shares only the page and the /stream connection's "hand" event.
-      var HERO_TEXT = 'caress me i need u';
+      //
+      // Text is switchable: HERO_TEXT_DEFAULT is the normal invitation,
+      // HERO_TEXT_LOST is the system-notice swapped in during REUNITING
+      // (see window.__setLyricHero / __LYRIC_HERO below).
+      var HERO_TEXT_DEFAULT = 'caress me i need u';
+      var HERO_TEXT_LOST = '[Consciousness Lost]';
+      var heroText = HERO_TEXT_DEFAULT;
+      var heroShowPalm = true;
+
+      // The two hero labels, exposed for the second <script> block (the IIFEs
+      // don't share scope) — read by enterReuniting()/exitReuniting() instead
+      // of duplicating these strings in a second place.
+      window.__LYRIC_HERO = { def: HERO_TEXT_DEFAULT, lost: HERO_TEXT_LOST };
 
       var SAMPLE_STEP = 2;
       var MASK_ALPHA_THRESHOLD = 60;   // 遮罩采样阈值；越低越能保留细笔画
       var HOLD_SECONDS = 4;          // formed "breathing" hold before auto-disperse
       var DISPERSED_HOLD_SECONDS = 2; // pause after dispersing before auto-regather
       var GRACE_MS = 5000;            // wait this long for a real hand signal before auto-looping
+
+      // DISPERSE timing: burst apart, then funnel toward a fixed point above
+      // the screen. Fades in almost as soon as the funnel pull kicks in —
+      // only a brief moment of full opacity before the fade tail starts.
+      var CONVERGE_DELAY = 0.18;      // seconds of initial burst before the funnel pull kicks in
+      var DISPERSE_FADE_START = 0.35; // stay fully visible until this many seconds in
+      var DISPERSE_SECONDS = 1.0;     // total DISPERSE duration before SCATTERED
+      var FUNNEL_PULL = 0.95;         // acceleration magnitude toward the funnel point once converging
+
+      // Arrow opacity independent of the particles: starts fading in while
+      // still in DISPERSE (overlapping the particles' own fade-out so there's
+      // no blackout gap between them), fully visible through SCATTERED, then
+      // fades back out once GATHER/FORMED begins.
+      var ARROW_LEAD = 0.45;      // seconds into DISPERSE before the arrow starts fading in
+      var ARROW_FADE_IN = 0.08;   // per-frame lerp fraction while fading in
+      var ARROW_FADE_OUT = 0.1;  // per-frame lerp fraction while fading out
+      var arrowAlpha = 0;
+
+      // Arrow placement + material — matched to the hero particles' own
+      // RGB-split/shimmer/scanline look so it doesn't read as a clean vector
+      // pasted on top. See drawScatteredArrow().
+      var ARROW_Y_OFFSET_RATIO = 0.65; // arrow center, below heroCenterY, in heroFontSize units
+      var ARROW_RGB_SPLIT = 0.18;      // red/blue offset, in arrow-pixel-edge units
+      var ARROW_SHIMMER = 0.22;        // per-pixel brightness wobble amplitude (0 = off)
+      var ARROW_SYNC_GLITCH_SLICE = true; // set false to stop reusing hero text's slice-glitch timing
 
       // Spring-damper motion (GATHER + FORMED only) — replaces the old linear
       // lerp so particles overshoot their target and ring down instead of
@@ -218,6 +326,7 @@
       var rippleEnvelope = 1.0;
       var heroCenterX = 0;
       var heroCenterY = 0;
+      var heroFontSize = 40;
 
       var canvas = document.getElementById('particle-canvas');
       var ctx = canvas.getContext('2d');
@@ -241,6 +350,9 @@
         state = s;
         stateStartTime = performance.now();
         if (s === STATE_DISPERSE) {
+          // All particles — text and palm alike — get the same initial
+          // burst. Palm particles no longer get any special-cased motion
+          // anywhere in setState()/update()/render().
           particles.forEach(function (p) {
             p.vy = -(1.2 + Math.random() * 1.8);
             p.vx = (Math.random() - 0.5) * 1.4;
@@ -277,7 +389,8 @@
             sx: scatter.x,
             sy: scatter.y,
             vx: 0,
-            vy: 0
+            vy: 0,
+            isPalm: !!t.isPalm
           });
         }
         particles = next;
@@ -293,38 +406,48 @@
         off.height = bandH;
         var octx = off.getContext('2d');
         var fontSize = Math.max(28, Math.min(w * 0.055, 92));
+        heroFontSize = fontSize;
         octx.font = '500 ' + fontSize + 'px LyricSerif, Cormorant, Georgia, serif';
         octx.fillStyle = '#fff';
         octx.textAlign = 'center';
         octx.textBaseline = 'middle';
-        octx.fillText(HERO_TEXT, w / 2, bandH / 2);
+        octx.fillText(heroText, w / 2, bandH / 2);
         octx.lineWidth = Math.max(1, fontSize * 0.012);
         octx.strokeStyle = '#fff';
-        octx.strokeText(HERO_TEXT, w / 2, bandH / 2);
+        octx.strokeText(heroText, w / 2, bandH / 2);
 
-        var PALM_D = 'M8 13v-7.5a1.5 1.5 0 0 1 3 0v6.5 M11 5.5v-2a1.5 1.5 0 1 1 3 0v8.5 M14 5.5a1.5 1.5 0 0 1 3 0v6.5 M17 7.5a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1 -6 6h-2h.208a6 6 0 0 1 -5.012 -2.7a69.74 69.74 0 0 1 -.196 -.3c-.312 -.479 -1.407 -2.388 -3.286 -5.728a1.5 1.5 0 0 1 .536 -2.022a1.867 1.867 0 0 1 2.28 .28l1.47 1.47';
         var palmSize = fontSize * 0.9;              // 图标高度约与字号相当
         var palmTop = bandH / 2 + fontSize / 2 + fontSize * 0.35;  // 文字底边下方留隙
         if (palmTop + palmSize > bandH) {
           palmSize = bandH - palmTop - 4;
         }
-        var palmScale = palmSize / 24;              // 原始 viewBox 为 24
-        octx.save();
-        octx.translate(w / 2 - palmSize / 2, palmTop);
-        octx.scale(palmScale, palmScale);
-        octx.lineWidth = Math.max(0.7, 2.2 / palmScale);
-        octx.lineCap = 'round';
-        octx.lineJoin = 'round';
-        octx.strokeStyle = '#fff';
-        octx.stroke(new Path2D(PALM_D));
-        octx.restore();
+        // Palm is the "come touch me" invitation — omitted when heroText is
+        // the REUNITING notice, which isn't inviting anything. isPalm
+        // tagging below stays untouched: with nothing drawn in this region,
+        // no pixels there pass MASK_ALPHA_THRESHOLD, so no palm particles
+        // get created naturally.
+        if (heroShowPalm) {
+          var PALM_D = 'M8 13v-7.5a1.5 1.5 0 0 1 3 0v6.5 M11 5.5v-2a1.5 1.5 0 1 1 3 0v8.5 M14 5.5a1.5 1.5 0 0 1 3 0v6.5 M17 7.5a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1 -6 6h-2h.208a6 6 0 0 1 -5.012 -2.7a69.74 69.74 0 0 1 -.196 -.3c-.312 -.479 -1.407 -2.388 -3.286 -5.728a1.5 1.5 0 0 1 .536 -2.022a1.867 1.867 0 0 1 2.28 .28l1.47 1.47';
+          var palmScale = palmSize / 24;              // 原始 viewBox 为 24
+          octx.save();
+          octx.translate(w / 2 - palmSize / 2, palmTop);
+          octx.scale(palmScale, palmScale);
+          octx.lineWidth = Math.max(0.7, 2.2 / palmScale);
+          octx.lineCap = 'round';
+          octx.lineJoin = 'round';
+          octx.strokeStyle = '#fff';
+          octx.stroke(new Path2D(PALM_D));
+          octx.restore();
+        }
 
         var data = octx.getImageData(0, 0, w, bandH).data;
         var pts = [];
         for (var y = 0; y < bandH; y += SAMPLE_STEP) {
           for (var x = 0; x < w; x += SAMPLE_STEP) {
             var idx = (y * w + x) * 4 + 3;
-            if (data[idx] > MASK_ALPHA_THRESHOLD) pts.push({ x: x, y: y });
+            // palmTop is strictly below the text's lowest pixel (gap enforced
+            // above), so a y at/past it can only belong to the palm icon.
+            if (data[idx] > MASK_ALPHA_THRESHOLD) pts.push({ x: x, y: y, isPalm: y >= palmTop });
           }
         }
         targets = pts;
@@ -339,6 +462,20 @@
         ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
         buildTargets();
       }
+
+      // 立即切换 hero 文案。硬切：粒子直接落到新目标点、状态直接进 FORMED，
+      // 不走 gather 的聚合过程 —— 这是一条系统告示顶替掉原来的祈求，
+      // 不该有"慢慢重新成形"的仪式感。
+      window.__setLyricHero = function (text, showPalm) {
+        heroText = text;
+        heroShowPalm = !!showPalm;
+        buildTargets();
+        particles.forEach(function (p) {
+          p.x = p.tx; p.y = p.ty; p.vx = 0; p.vy = 0;
+        });
+        rippleEnvelope = 0.35;   // 一点余波，不要完全死板
+        setState(STATE_FORMED);
+      };
 
       function forceDisperse() {
         if (state === STATE_DISPERSE || state === STATE_SCATTERED) return;
@@ -356,6 +493,11 @@
       }
 
       window.__onLyricHandEvent = function (e) {
+        // REUNITING: the flower is collapsed and doesn't accept outside
+        // input. hand_osc's uniting gate already forces /handon to 0 at the
+        // source, but that "0" still arrives as a real edge here unless we
+        // also refuse it on this side — otherwise it'd fire a forceRegather.
+        if (window.__lyricReuniting) return;
         var newHand = e.data === '1' ? 1 : 0;
         if (!handSignalSeen) {
           handSignalSeen = true;
@@ -408,12 +550,27 @@
           applySpring(now);
           if (autoLoopActive && t > HOLD_SECONDS) setState(STATE_DISPERSE);
         } else if (state === STATE_DISPERSE) {
+          // Everyone (text and palm alike) bursts apart for CONVERGE_DELAY
+          // seconds, then steers toward one fixed point above/off the top
+          // of the screen so they funnel together instead of scattering wide.
+          var funnelX = heroCenterX;
+          var funnelY = -window.innerHeight * 0.25;
           particles.forEach(function (p) {
-            p.x += p.vx;
-            p.y += p.vy;
-            p.vy -= 0.01; // keeps accelerating upward — no gravity pull-back
+            if (t < CONVERGE_DELAY) {
+              p.x += p.vx;
+              p.y += p.vy;
+              p.vy -= 0.01;
+            } else {
+              var dx = funnelX - p.x;
+              var dy = funnelY - p.y;
+              var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+              p.vx += (dx / dist) * FUNNEL_PULL;
+              p.vy += (dy / dist) * FUNNEL_PULL;
+              p.x += p.vx;
+              p.y += p.vy;
+            }
           });
-          if (t > 1.6) setState(STATE_SCATTERED);
+          if (t > DISPERSE_SECONDS) setState(STATE_SCATTERED);
         } else if (state === STATE_SCATTERED) {
           if (autoLoopActive && t > DISPERSED_HOLD_SECONDS) forceRegather();
         }
@@ -447,45 +604,161 @@
         ctx.restore();
       }
 
-      function render(now) {
-        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-        if (state === STATE_SCATTERED) return;
+      // 13x13 hollow up-arrow: triangle head + rectangular shaft, same
+      // pixel-line-art style as the lyric page's FACE_BITMAPS.
+      var ARROW_BITMAP = [
+        '......#......',
+        '.....#.#.....',
+        '....#...#....',
+        '...#.....#...',
+        '..#.......#..',
+        '.#.........#.',
+        '#####...#####',
+        '....#...#....',
+        '....#...#....',
+        '....#...#....',
+        '....#...#....',
+        '....#...#....',
+        '....#####....'
+      ];
 
-        var alpha = 1;
-        if (state === STATE_DISPERSE) {
-          alpha = Math.max(0, 1 - (now - stateStartTime) / 1600);
-        } else if (state === STATE_GATHER) {
-          alpha = Math.min(1, (now - stateStartTime) / 1000);
+      // Rests below where HERO_TEXT normally sits, fading in during the tail
+      // of DISPERSE and fading out on the way back to GATHER (see render() /
+      // arrowAlpha below) so it overlaps the particles instead of cutting in
+      // after a blackout gap. Pixel-block bitmap, not a vector path — integer
+      // coordinates only, no antialiasing, matching FACE_BITMAPS' technique.
+      //
+      // Material is deliberately built to match the hero particles' own
+      // look (render()'s FORMED pass): a fixed-alpha red/blue RGB-split
+      // pair flanking a white core, the white core alone shimmering (not
+      // the color fringes, same as the hero particles), plus a scanline
+      // sweep local to the arrow's own footprint. Collected into a flat
+      // pixel array first so each of the three passes only sets fillStyle
+      // once (or once per pixel for the shimmering white pass) instead of
+      // thrashing state inside a nested loop.
+      function drawScatteredArrow(a, now) {
+        var px = Math.max(2, Math.round(heroFontSize * 0.115));
+        var size = 13 * px;
+        var x0 = Math.round(heroCenterX - size / 2);
+        var y0 = Math.round(heroCenterY - size / 2 + heroFontSize * ARROW_Y_OFFSET_RATIO);
+
+        var sliceActive = ARROW_SYNC_GLITCH_SLICE && glitchSliceActive(now);
+
+        var pixels = [];
+        for (var y = 0; y < ARROW_BITMAP.length; y++) {
+          var row = ARROW_BITMAP[y];
+          for (var x = 0; x < row.length; x++) {
+            if (row.charAt(x) !== '#') continue;
+            var ax = x0 + x * px, ay = y0 + y * px;
+            if (sliceActive && ay > sliceBand.y0 && ay < sliceBand.y1) ax += sliceBand.offset;
+            var seed = x * 7 + y * 13;
+            var sh = (1 - ARROW_SHIMMER) + ARROW_SHIMMER * (0.5 + 0.5 * Math.sin(now * 0.004 + seed));
+            pixels.push({ ax: ax, ay: ay, sh: sh });
+          }
         }
 
-        var doGlitch = state === STATE_FORMED;
-        var sliceActive = doGlitch && glitchSliceActive(now);
-        var rgbOffset = doGlitch ? 1.4 : 0;
+        var off = Math.max(1, px * ARROW_RGB_SPLIT);
+        var i;
 
         ctx.save();
-        ctx.shadowColor = 'rgba(255,255,255,0.7)';
-        ctx.shadowBlur = 6;
+        ctx.shadowBlur = 0;
 
-        particles.forEach(function (p) {
-          var dx = 0;
-          if (sliceActive && p.y > sliceBand.y0 && p.y < sliceBand.y1) dx = sliceBand.offset;
-          var px = p.x + dx, py = p.y;
-          if (rgbOffset > 0) {
-            ctx.fillStyle = 'rgba(255,60,60,' + (0.5 * alpha) + ')';
-            ctx.fillRect(px - rgbOffset, py, 1.6, 1.6);
-            ctx.fillStyle = 'rgba(60,180,255,' + (0.5 * alpha) + ')';
-            ctx.fillRect(px + rgbOffset, py, 1.6, 1.6);
-            ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
-            ctx.fillRect(px, py, 1.6, 1.6);
-          } else {
-            ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
-            ctx.fillRect(px, py, 1.6, 1.6);
-          }
-        });
+        ctx.fillStyle = 'rgba(255,60,60,' + (0.5 * a) + ')';
+        for (i = 0; i < pixels.length; i++) {
+          ctx.fillRect(pixels[i].ax - off, pixels[i].ay, px, px);
+        }
+
+        ctx.fillStyle = 'rgba(60,180,255,' + (0.5 * a) + ')';
+        for (i = 0; i < pixels.length; i++) {
+          ctx.fillRect(pixels[i].ax + off, pixels[i].ay, px, px);
+        }
+
+        ctx.shadowColor = 'rgba(255,255,255,0.55)';
+        ctx.shadowBlur = 5 * a;
+        for (i = 0; i < pixels.length; i++) {
+          var p = pixels[i];
+          ctx.fillStyle = 'rgba(255,255,255,' + (0.8 * a * p.sh) + ')';
+          ctx.fillRect(p.ax, p.ay, px, px);
+        }
 
         ctx.restore();
 
-        if (doGlitch) drawScanlines(now, alpha);
+        // Scanline sweep, clipped to the arrow's own bounding box — same
+        // cadence as drawScanlines(), which only runs full-screen in FORMED
+        // and never reaches here otherwise.
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x0, y0, size, size);
+        ctx.clip();
+        ctx.globalAlpha = 0.06 * a;
+        ctx.fillStyle = '#fff';
+        var offset = (now / 40) % 6;
+        for (var yy = offset; yy < size; yy += 6) {
+          ctx.fillRect(x0, y0 + yy, size, 1);
+        }
+        ctx.restore();
+      }
+
+      function render(now) {
+        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+        // SCATTERED draws no particles (they're sitting up near the funnel
+        // point off screen — drawing them there would just be a stray
+        // leftover cluster). Every other state draws normally.
+        if (state !== STATE_SCATTERED) {
+          var alpha = 1;
+          if (state === STATE_DISPERSE) {
+            var tDisperse = (now - stateStartTime) / 1000;
+            alpha = tDisperse > DISPERSE_FADE_START
+              ? Math.max(0, 1 - (tDisperse - DISPERSE_FADE_START) / (DISPERSE_SECONDS - DISPERSE_FADE_START))
+              : 1;
+          } else if (state === STATE_GATHER) {
+            alpha = Math.min(1, (now - stateStartTime) / 1000);
+          }
+
+          var doGlitch = state === STATE_FORMED;
+          var sliceActive = doGlitch && glitchSliceActive(now);
+          var rgbOffset = doGlitch ? 1.4 : 0;
+
+          ctx.save();
+          ctx.shadowColor = 'rgba(255,255,255,0.7)';
+          ctx.shadowBlur = 6;
+
+          particles.forEach(function (p) {
+            var dx = 0;
+            if (sliceActive && p.y > sliceBand.y0 && p.y < sliceBand.y1) dx = sliceBand.offset;
+            var px = p.x + dx, py = p.y;
+            if (rgbOffset > 0) {
+              ctx.fillStyle = 'rgba(255,60,60,' + (0.5 * alpha) + ')';
+              ctx.fillRect(px - rgbOffset, py, 1.6, 1.6);
+              ctx.fillStyle = 'rgba(60,180,255,' + (0.5 * alpha) + ')';
+              ctx.fillRect(px + rgbOffset, py, 1.6, 1.6);
+              ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
+              ctx.fillRect(px, py, 1.6, 1.6);
+            } else {
+              ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * alpha) + ')';
+              ctx.fillRect(px, py, 1.6, 1.6);
+            }
+          });
+
+          ctx.restore();
+
+          if (doGlitch) drawScanlines(now, alpha);
+        }
+
+        // Arrow fades in during the tail of DISPERSE (overlapping the
+        // particles' own fade-out so there's no blackout gap between them),
+        // stays on through SCATTERED, and fades back out once GATHER/FORMED
+        // begins.
+        var arrowTarget = 0;
+        if (state === STATE_SCATTERED) {
+          arrowTarget = 1;
+        } else if (state === STATE_DISPERSE && (now - stateStartTime) / 1000 > ARROW_LEAD) {
+          arrowTarget = 1;
+        }
+        arrowAlpha += (arrowTarget - arrowAlpha) * (arrowTarget > arrowAlpha ? ARROW_FADE_IN : ARROW_FADE_OUT);
+        if (arrowAlpha < 0.005) arrowAlpha = 0;
+        if (arrowAlpha > 0.005) drawScatteredArrow(arrowAlpha, now);
       }
 
       function tick(now) {
@@ -645,9 +918,108 @@
         return svg;
       }
 
+      // REUNITING loading state: clears the stack and shows a spinner +
+      // a single "reuniting....Ns" line (dots + countdown share one
+      // element) until the next real line arrives.
+      var reunitingActive = false;
+      var reunitingEl = null;
+      var reunitingDotsTimer = null;
+
+      function buildReunitingOverlay() {
+        var wrap = document.createElement('div');
+        wrap.className = 'reuniting-overlay';
+
+        var spinner = document.createElement('div');
+        spinner.className = 'reuniting-spinner';
+        for (var i = 0; i < 8; i++) {
+          spinner.appendChild(document.createElement('i'));
+        }
+
+        var caption = document.createElement('div');
+        caption.className = 'reuniting-caption';
+        caption.appendChild(document.createTextNode('reuniting'));
+
+        var dots = document.createElement('span');
+        dots.className = 'reuniting-dots';
+        caption.appendChild(dots);
+
+        var secs = document.createElement('span');
+        secs.className = 'reuniting-secs';
+        caption.appendChild(secs);
+
+        wrap.appendChild(spinner);
+        wrap.appendChild(caption);
+        return wrap;
+      }
+
+      function enterReuniting(totalSeconds) {
+        if (reunitingActive) return;
+        reunitingActive = true;
+        // TEMP diagnostic (A0) — remove once the early-exit cause is confirmed.
+        console.log('[diag] enterReuniting @', new Date().toISOString(), 'totalSeconds=', totalSeconds);
+
+        window.__lyricReuniting = true;
+        if (window.__setLyricHero && window.__LYRIC_HERO) {
+          window.__setLyricHero(window.__LYRIC_HERO.lost, false);
+        }
+
+        Array.prototype.slice.call(stack.children).forEach(function (el) {
+          if (el.parentNode) el.parentNode.removeChild(el);
+        });
+
+        reunitingEl = buildReunitingOverlay();
+        stack.appendChild(reunitingEl);
+
+        var dotsEl = reunitingEl.querySelector('.reuniting-dots');
+        var secsEl = reunitingEl.querySelector('.reuniting-secs');
+        var startTime = performance.now();
+        var dotCount = 0;
+        var tickCount = 0;
+        // 250ms ticks keep the seconds readout from skipping/stuttering
+        // against Math.ceil(); the dots only advance every other tick so
+        // they still land on roughly the original ~500ms-per-dot pace.
+        reunitingDotsTimer = setInterval(function () {
+          tickCount++;
+          if (tickCount % 2 === 0) {
+            dotCount = (dotCount + 1) % 4;
+            dotsEl.textContent = '.'.repeat(dotCount);
+          }
+          if (totalSeconds > 0) {
+            var elapsed = (performance.now() - startTime) / 1000;
+            var remaining = Math.ceil(totalSeconds - elapsed);
+            secsEl.textContent = remaining > 0 ? remaining + 's' : '';
+          }
+        }, 250);
+      }
+
+      function exitReuniting() {
+        if (!reunitingActive) return;
+        reunitingActive = false;
+        // TEMP diagnostic (A0) — remove once the early-exit cause is confirmed.
+        // Stack frame [1] (after "Error") names the caller — addLine() vs.
+        // something else — which is the whole question here.
+        console.log('[diag] exitReuniting @', new Date().toISOString(), '\n' + new Error().stack.split('\n').slice(0, 3).join('\n'));
+
+        window.__lyricReuniting = false;
+        if (window.__setLyricHero && window.__LYRIC_HERO) {
+          window.__setLyricHero(window.__LYRIC_HERO.def, true);
+        }
+
+        if (reunitingDotsTimer !== null) {
+          clearInterval(reunitingDotsTimer);
+          reunitingDotsTimer = null;
+        }
+        if (reunitingEl && reunitingEl.parentNode) {
+          reunitingEl.parentNode.removeChild(reunitingEl);
+        }
+        reunitingEl = null;
+      }
+
       function addLine(text, mood) {
         text = (text || '').trim();
         if (!text) return;
+
+        exitReuniting();
 
         var existing = Array.prototype.slice.call(stack.children);
         var oldRects = existing.map(function (el) { return el.getBoundingClientRect(); });
@@ -717,6 +1089,11 @@
 
         es.addEventListener('hand', function (e) {
           if (window.__onLyricHandEvent) window.__onLyricHandEvent(e);
+        });
+
+        es.addEventListener('reuniting', function (e) {
+          var secs = parseFloat(e.data);
+          enterReuniting(isNaN(secs) ? 0 : secs);
         });
 
         es.onmessage = function (e) {
